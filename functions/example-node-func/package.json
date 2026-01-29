@@ -1,0 +1,15 @@
+{
+  "name": "example-node-func",
+  "version": "1.0.0",
+  "description": "SmolFaaS Example Node.js Function",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["smolfaas", "function", "nodejs"],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
