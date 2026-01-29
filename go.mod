@@ -9,6 +9,7 @@ require (
 	github.com/moby/buildkit v0.21.1
 	github.com/spf13/cobra v1.8.1
 	golang.org/x/sync v0.13.0
+	golang.org/x/term v0.31.0
 )
 
 require (

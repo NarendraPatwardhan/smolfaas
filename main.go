@@ -67,6 +67,7 @@ import (
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
+	"golang.org/x/term"
 
 	docker "github.com/docker/docker/client"
 	_ "github.com/mattn/go-sqlite3"
@@ -158,6 +159,400 @@ type FunctionState struct {
 	ContentHash   string    // SHA256 hash of all source files
 	ImageID       string    // Docker image ID
 	LastBuildTime time.Time // When the function was last built
+}
+
+// BuildError represents a structured error that occurred during function building.
+// This enables graceful error handling where other functions can continue building.
+type BuildError struct {
+	FunctionName string // Name of the function that failed
+	Phase        string // Phase where failure occurred: "hash", "llb", "marshal", "build"
+	Err          error  // The underlying error
+}
+
+func (e *BuildError) Error() string {
+	return fmt.Sprintf("%s: %s failed: %v", e.FunctionName, e.Phase, e.Err)
+}
+
+// BuildResult tracks the outcome of building a single function.
+type BuildResult struct {
+	Function    FunctionDefinition
+	Success     bool
+	Skipped     bool   // True if function was up-to-date
+	Error       *BuildError
+	Duration    time.Duration
+}
+
+// ============================================================================
+// Pretty Logger (Attractive Console Output)
+// ============================================================================
+
+// ANSI color codes for terminal output
+const (
+	colorReset   = "\033[0m"
+	colorDim     = "\033[2m"
+	colorBold    = "\033[1m"
+	colorRed     = "\033[31m"
+	colorGreen   = "\033[32m"
+	colorYellow  = "\033[33m"
+	colorBlue    = "\033[34m"
+	colorMagenta = "\033[35m"
+	colorCyan    = "\033[36m"
+)
+
+// PrettyHandler implements slog.Handler with attractive colored output.
+type PrettyHandler struct {
+	out      io.Writer
+	level    slog.Level
+	mu       sync.Mutex
+	useColor bool
+}
+
+// NewPrettyHandler creates a new PrettyHandler that writes to the given output.
+func NewPrettyHandler(out io.Writer, level slog.Level) *PrettyHandler {
+	useColor := false
+	if f, ok := out.(*os.File); ok {
+		useColor = term.IsTerminal(int(f.Fd()))
+	}
+	return &PrettyHandler{out: out, level: level, useColor: useColor}
+}
+
+func (h *PrettyHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= h.level
+}
+
+func (h *PrettyHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Format timestamp
+	timestamp := r.Time.Format("15:04:05")
+
+	// Get level icon and color
+	var icon, levelColor string
+	switch r.Level {
+	case slog.LevelDebug:
+		icon, levelColor = "·", colorDim
+	case slog.LevelInfo:
+		icon, levelColor = "●", colorCyan
+	case slog.LevelWarn:
+		icon, levelColor = "▲", colorYellow
+	case slog.LevelError:
+		icon, levelColor = "✖", colorRed
+	default:
+		icon, levelColor = "?", colorReset
+	}
+
+	// Build the output line
+	var buf strings.Builder
+
+	if h.useColor {
+		// Colored output: "● 15:04:05  Message  key=value"
+		buf.WriteString(levelColor)
+		buf.WriteString(icon)
+		buf.WriteString(colorReset)
+		buf.WriteString(" ")
+		buf.WriteString(colorDim)
+		buf.WriteString(timestamp)
+		buf.WriteString(colorReset)
+		buf.WriteString("  ")
+		buf.WriteString(r.Message)
+	} else {
+		// Plain output: "● 15:04:05  Message  key=value"
+		buf.WriteString(icon)
+		buf.WriteString(" ")
+		buf.WriteString(timestamp)
+		buf.WriteString("  ")
+		buf.WriteString(r.Message)
+	}
+
+	// Add attributes
+	r.Attrs(func(a slog.Attr) bool {
+		buf.WriteString("  ")
+		if h.useColor {
+			buf.WriteString(colorDim)
+			buf.WriteString(a.Key)
+			buf.WriteString("=")
+			buf.WriteString(colorReset)
+			buf.WriteString(a.Value.String())
+		} else {
+			buf.WriteString(a.Key)
+			buf.WriteString("=")
+			buf.WriteString(a.Value.String())
+		}
+		return true
+	})
+
+	buf.WriteString("\n")
+	_, err := h.out.Write([]byte(buf.String()))
+	return err
+}
+
+func (h *PrettyHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return h // Simplified: ignore group attrs for now
+}
+
+func (h *PrettyHandler) WithGroup(name string) slog.Handler {
+	return h // Simplified: ignore groups for now
+}
+
+// ============================================================================
+// Multi-Progress Display (Parallel Build Progress)
+// ============================================================================
+
+// BuildProgress tracks the progress of a single function build.
+type BuildProgress struct {
+	FunctionName string
+	Status       string    // "pending", "building", "complete", "failed"
+	CurrentStep  string    // Current build step description
+	StartTime    time.Time
+	EndTime      time.Time
+	TotalSteps   int
+	DoneSteps    int
+}
+
+// MultiProgressDisplay manages progress display for multiple concurrent builds.
+type MultiProgressDisplay struct {
+	mu           sync.Mutex
+	builds       map[string]*BuildProgress
+	buildOrder   []string // Maintain consistent ordering
+	out          io.Writer
+	useColor     bool
+	isTTY        bool
+	lastLines    int // Number of lines printed last render (for clearing)
+	startTime    time.Time
+}
+
+// NewMultiProgressDisplay creates a new multi-progress display.
+func NewMultiProgressDisplay(out io.Writer) *MultiProgressDisplay {
+	isTTY := false
+	useColor := false
+	if f, ok := out.(*os.File); ok {
+		isTTY = term.IsTerminal(int(f.Fd()))
+		useColor = isTTY
+	}
+	return &MultiProgressDisplay{
+		builds:    make(map[string]*BuildProgress),
+		out:       out,
+		useColor:  useColor,
+		isTTY:     isTTY,
+		startTime: time.Now(),
+	}
+}
+
+// AddBuild registers a new function build to track.
+func (mpd *MultiProgressDisplay) AddBuild(funcName string) {
+	mpd.mu.Lock()
+	defer mpd.mu.Unlock()
+
+	mpd.builds[funcName] = &BuildProgress{
+		FunctionName: funcName,
+		Status:       "pending",
+		CurrentStep:  "Waiting...",
+		StartTime:    time.Now(),
+	}
+	mpd.buildOrder = append(mpd.buildOrder, funcName)
+}
+
+// UpdateBuild updates the progress for a function.
+func (mpd *MultiProgressDisplay) UpdateBuild(funcName, status, step string, done, total int) {
+	mpd.mu.Lock()
+	defer mpd.mu.Unlock()
+
+	if bp, ok := mpd.builds[funcName]; ok {
+		bp.Status = status
+		if step != "" {
+			bp.CurrentStep = step
+		}
+		bp.DoneSteps = done
+		bp.TotalSteps = total
+		if status == "complete" || status == "failed" {
+			bp.EndTime = time.Now()
+		}
+	}
+	mpd.render()
+}
+
+// MarkComplete marks a build as complete.
+func (mpd *MultiProgressDisplay) MarkComplete(funcName string, success bool) {
+	status := "complete"
+	if !success {
+		status = "failed"
+	}
+	mpd.UpdateBuild(funcName, status, "", 0, 0)
+}
+
+// render draws the current progress state to the terminal.
+func (mpd *MultiProgressDisplay) render() {
+	if !mpd.isTTY {
+		return // Don't render progress bars for non-TTY
+	}
+
+	var buf strings.Builder
+
+	// Move cursor up to overwrite previous output
+	if mpd.lastLines > 0 {
+		buf.WriteString(fmt.Sprintf("\033[%dA", mpd.lastLines))
+	}
+
+	// Clear lines and render new content
+	lineCount := 0
+
+	// Header
+	elapsed := time.Since(mpd.startTime).Round(time.Second)
+	header := fmt.Sprintf("Building %d functions... (%s)", len(mpd.builds), elapsed)
+	if mpd.useColor {
+		buf.WriteString(colorBold + header + colorReset + "\033[K\n")
+	} else {
+		buf.WriteString(header + "\033[K\n")
+	}
+	lineCount++
+	buf.WriteString("\033[K\n")
+	lineCount++
+
+	// Each build
+	for _, name := range mpd.buildOrder {
+		bp := mpd.builds[name]
+		line := mpd.formatBuildLine(bp)
+		buf.WriteString(line + "\033[K\n")
+		lineCount++
+	}
+
+	buf.WriteString("\033[K\n")
+	lineCount++
+
+	mpd.lastLines = lineCount
+	mpd.out.Write([]byte(buf.String()))
+}
+
+// formatBuildLine formats a single build progress line.
+func (mpd *MultiProgressDisplay) formatBuildLine(bp *BuildProgress) string {
+	// Name (padded to 24 chars)
+	name := bp.FunctionName
+	if len(name) > 24 {
+		name = name[:21] + "..."
+	}
+	name = fmt.Sprintf("%-24s", name)
+
+	// Progress bar (16 chars)
+	var progress float64
+	if bp.TotalSteps > 0 {
+		progress = float64(bp.DoneSteps) / float64(bp.TotalSteps)
+	}
+	barWidth := 16
+	filled := int(progress * float64(barWidth))
+	if filled > barWidth {
+		filled = barWidth
+	}
+
+	var bar string
+	var statusIcon string
+	var statusColor string
+
+	switch bp.Status {
+	case "pending":
+		bar = strings.Repeat("░", barWidth)
+		statusIcon = "○"
+		statusColor = colorDim
+	case "building":
+		bar = strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+		statusIcon = "◐"
+		statusColor = colorCyan
+	case "complete":
+		bar = strings.Repeat("█", barWidth)
+		statusIcon = "✓"
+		statusColor = colorGreen
+	case "failed":
+		bar = strings.Repeat("░", barWidth)
+		statusIcon = "✖"
+		statusColor = colorRed
+	default:
+		bar = strings.Repeat("░", barWidth)
+		statusIcon = "?"
+		statusColor = colorReset
+	}
+
+	// Step description (truncated)
+	step := bp.CurrentStep
+	if len(step) > 30 {
+		step = step[:27] + "..."
+	}
+
+	// Format percentage
+	pct := fmt.Sprintf("%3d%%", int(progress*100))
+
+	if mpd.useColor {
+		return fmt.Sprintf("  %s%s%s %s [%s] %s  %s",
+			statusColor, statusIcon, colorReset,
+			name, bar, pct, step)
+	}
+	return fmt.Sprintf("  %s %s [%s] %s  %s", statusIcon, name, bar, pct, step)
+}
+
+// Finish clears the progress display and prints final status.
+func (mpd *MultiProgressDisplay) Finish() {
+	mpd.mu.Lock()
+	defer mpd.mu.Unlock()
+
+	if !mpd.isTTY {
+		return
+	}
+
+	// Clear the progress display
+	if mpd.lastLines > 0 {
+		for i := 0; i < mpd.lastLines; i++ {
+			mpd.out.Write([]byte("\033[A\033[K"))
+		}
+	}
+}
+
+// ConsumeStatusChannel reads from a BuildKit status channel and updates progress.
+// This runs in a goroutine for each build.
+func (mpd *MultiProgressDisplay) ConsumeStatusChannel(funcName string, ch chan *buildkit.SolveStatus) {
+	mpd.UpdateBuild(funcName, "building", "Starting...", 0, 1)
+
+	vertexStatus := make(map[string]bool) // Track completed vertices
+	totalVertices := 0
+	doneVertices := 0
+
+	for status := range ch {
+		var currentStep string
+
+		for _, v := range status.Vertexes {
+			if _, seen := vertexStatus[v.Digest.String()]; !seen {
+				totalVertices++
+				vertexStatus[v.Digest.String()] = false
+			}
+
+			if v.Completed != nil && !vertexStatus[v.Digest.String()] {
+				vertexStatus[v.Digest.String()] = true
+				doneVertices++
+			}
+
+			// Use the most recent non-completed vertex as current step
+			if v.Completed == nil && v.Name != "" {
+				currentStep = v.Name
+			}
+		}
+
+		// Also check statuses for current activity
+		for _, s := range status.Statuses {
+			if s.Name != "" {
+				currentStep = s.Name
+			}
+		}
+
+		if currentStep == "" && len(status.Vertexes) > 0 {
+			// Find last active vertex
+			for i := len(status.Vertexes) - 1; i >= 0; i-- {
+				if status.Vertexes[i].Name != "" {
+					currentStep = status.Vertexes[i].Name
+					break
+				}
+			}
+		}
+
+		mpd.UpdateBuild(funcName, "building", currentStep, doneVertices, totalVertices)
+	}
 }
 
 // ============================================================================
@@ -1072,7 +1467,8 @@ func (fb *FaaSBuilder) checkFunctionIncrementalStatus(funcDef *FunctionDefinitio
 }
 
 // buildAndLoadFunctionImage builds a function image and loads it into Docker.
-func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *FunctionDefinition) error {
+// If progressDisplay is provided, it updates that display; otherwise uses standard progressui.
+func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *FunctionDefinition, progressDisplay *MultiProgressDisplay) error {
 	if fb.buildkitMgr == nil || fb.buildkitMgr.buildkitClient == nil {
 		return fmt.Errorf("buildkit client not available")
 	}
@@ -1112,8 +1508,14 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 		return nil
 	})
 
-	// Progress display goroutine
+	// Progress display goroutine - use multi-progress display if available
 	buildEg.Go(func() error {
+		if progressDisplay != nil {
+			// Use the shared multi-progress display
+			progressDisplay.ConsumeStatusChannel(funcDef.Name, ch)
+			return nil
+		}
+		// Fallback to standard progressui for single builds
 		display, err := progressui.NewDisplay(os.Stderr, progressui.AutoMode)
 		if err != nil {
 			// Drain channel if display fails
@@ -1144,6 +1546,9 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 	})
 
 	if err := buildEg.Wait(); err != nil {
+		if progressDisplay != nil {
+			progressDisplay.MarkComplete(funcDef.Name, false)
+		}
 		return fmt.Errorf("build failed: %w", err)
 	}
 
@@ -1151,9 +1556,14 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 	tarWg.Wait()
 
 	// Load image into Docker
-	logger.Info("Loading image into Docker", "size", tarBuffer.Len())
+	if progressDisplay != nil {
+		progressDisplay.UpdateBuild(funcDef.Name, "building", "Loading image into Docker...", 0, 0)
+	}
 	resp, err := fb.buildkitMgr.dockerClient.ImageLoad(ctx, bytes.NewReader(tarBuffer.Bytes()))
 	if err != nil {
+		if progressDisplay != nil {
+			progressDisplay.MarkComplete(funcDef.Name, false)
+		}
 		return fmt.Errorf("failed to load image: %w", err)
 	}
 	defer resp.Body.Close()
@@ -1162,6 +1572,9 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 	// Get image ID
 	imgInspect, err := fb.buildkitMgr.dockerClient.ImageInspect(ctx, funcDef.ImageName)
 	if err != nil {
+		if progressDisplay != nil {
+			progressDisplay.MarkComplete(funcDef.Name, false)
+		}
 		return fmt.Errorf("failed to inspect built image: %w", err)
 	}
 
@@ -1179,12 +1592,17 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 		logger.Warn("Failed to save state", "error", err)
 	}
 
+	if progressDisplay != nil {
+		progressDisplay.MarkComplete(funcDef.Name, true)
+	}
+
 	logger.Info("Image built successfully", "function", funcDef.Name,
 		"duration", time.Since(startTime).Round(time.Millisecond))
 	return nil
 }
 
 // BuildAndCheckAllFunctions orchestrates the build process for all functions.
+// It provides graceful error handling - failures in one function don't affect others.
 func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefinition, error) {
 	logger.Info("Starting build process", "dir", baseDir)
 
@@ -1197,81 +1615,274 @@ func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefi
 		return nil, nil
 	}
 
-	var readyFuncs []FunctionDefinition
-	var readyMutex sync.Mutex
-	var buildErrors []error
-	var errorMutex sync.Mutex
+	// Track results for each function
+	var results []BuildResult
+	var resultsMutex sync.Mutex
 
+	// Determine which functions need building
+	var toBuild []int
+	for i := range funcs {
+		fn := &funcs[i]
+		if err := fb.checkFunctionIncrementalStatus(fn); err != nil {
+			resultsMutex.Lock()
+			results = append(results, BuildResult{
+				Function: *fn,
+				Success:  false,
+				Error:    &BuildError{FunctionName: fn.Name, Phase: "hash", Err: err},
+			})
+			resultsMutex.Unlock()
+			continue
+		}
+
+		if fn.RequiresRebuild {
+			toBuild = append(toBuild, i)
+		} else {
+			// Already up-to-date
+			fn.BuildSuccessful = true
+			resultsMutex.Lock()
+			results = append(results, BuildResult{
+				Function: *fn,
+				Success:  true,
+				Skipped:  true,
+			})
+			resultsMutex.Unlock()
+		}
+	}
+
+	// Create multi-progress display for parallel builds
+	var progressDisplay *MultiProgressDisplay
+	if len(toBuild) > 1 {
+		progressDisplay = NewMultiProgressDisplay(os.Stderr)
+		for _, idx := range toBuild {
+			progressDisplay.AddBuild(funcs[idx].Name)
+		}
+	}
+
+	// Build functions in parallel
 	g, groupCtx := errgroup.WithContext(fb.buildkitMgr.ctx)
 
-	for i := range funcs {
-		fnIndex := i
+	for _, idx := range toBuild {
+		fnIndex := idx
 		fn := &funcs[fnIndex]
 
 		g.Go(func() error {
 			if groupCtx.Err() != nil {
-				return groupCtx.Err()
+				return nil // Don't propagate context errors
 			}
 
-			logger.Info("Processing function", "name", fn.Name)
+			startTime := time.Now()
 
-			if err := fb.checkFunctionIncrementalStatus(fn); err != nil {
-				errorMutex.Lock()
-				buildErrors = append(buildErrors, fmt.Errorf("%s: %w", fn.Name, err))
-				errorMutex.Unlock()
+			// Generate LLB
+			llbState, err := fn.RuntimeHandler.GenerateLLB(*fn)
+			if err != nil {
+				if progressDisplay != nil {
+					progressDisplay.MarkComplete(fn.Name, false)
+				}
+				resultsMutex.Lock()
+				results = append(results, BuildResult{
+					Function: *fn,
+					Success:  false,
+					Error:    &BuildError{FunctionName: fn.Name, Phase: "llb", Err: err},
+					Duration: time.Since(startTime),
+				})
+				resultsMutex.Unlock()
 				return nil
 			}
 
-			if fn.RequiresRebuild {
-				logger.Info("Rebuilding function", "name", fn.Name)
-
-				llbState, err := fn.RuntimeHandler.GenerateLLB(*fn)
-				if err != nil {
-					errorMutex.Lock()
-					buildErrors = append(buildErrors, fmt.Errorf("%s LLB: %w", fn.Name, err))
-					errorMutex.Unlock()
-					return nil
+			// Marshal LLB
+			def, err := llbState.Marshal(groupCtx)
+			if err != nil {
+				if progressDisplay != nil {
+					progressDisplay.MarkComplete(fn.Name, false)
 				}
-
-				def, err := llbState.Marshal(groupCtx)
-				if err != nil {
-					errorMutex.Lock()
-					buildErrors = append(buildErrors, fmt.Errorf("%s marshal: %w", fn.Name, err))
-					errorMutex.Unlock()
-					return nil
-				}
-
-				if err := fb.buildAndLoadFunctionImage(def, fn); err != nil {
-					errorMutex.Lock()
-					buildErrors = append(buildErrors, fmt.Errorf("%s build: %w", fn.Name, err))
-					errorMutex.Unlock()
-					return nil
-				}
-			} else {
-				fn.BuildSuccessful = true
+				resultsMutex.Lock()
+				results = append(results, BuildResult{
+					Function: *fn,
+					Success:  false,
+					Error:    &BuildError{FunctionName: fn.Name, Phase: "marshal", Err: err},
+					Duration: time.Since(startTime),
+				})
+				resultsMutex.Unlock()
+				return nil
 			}
 
-			if fn.BuildSuccessful {
-				readyMutex.Lock()
-				readyFuncs = append(readyFuncs, *fn)
-				readyMutex.Unlock()
+			// Build and load image
+			if err := fb.buildAndLoadFunctionImage(def, fn, progressDisplay); err != nil {
+				resultsMutex.Lock()
+				results = append(results, BuildResult{
+					Function: *fn,
+					Success:  false,
+					Error:    &BuildError{FunctionName: fn.Name, Phase: "build", Err: err},
+					Duration: time.Since(startTime),
+				})
+				resultsMutex.Unlock()
+				return nil
 			}
+
+			resultsMutex.Lock()
+			results = append(results, BuildResult{
+				Function: *fn,
+				Success:  true,
+				Skipped:  false,
+				Duration: time.Since(startTime),
+			})
+			resultsMutex.Unlock()
 
 			return nil
 		})
 	}
 
-	waitErr := g.Wait()
+	g.Wait()
 
-	if waitErr != nil {
-		return readyFuncs, waitErr
+	// Clean up progress display
+	if progressDisplay != nil {
+		progressDisplay.Finish()
 	}
+
+	// Print build summary
+	fb.printBuildSummary(results)
+
+	// Collect ready functions and errors
+	var readyFuncs []FunctionDefinition
+	var buildErrors []*BuildError
+
+	for _, r := range results {
+		if r.Success {
+			readyFuncs = append(readyFuncs, r.Function)
+		} else if r.Error != nil {
+			buildErrors = append(buildErrors, r.Error)
+		}
+	}
+
 	if len(buildErrors) > 0 {
-		return readyFuncs, fmt.Errorf("build errors: %v", buildErrors)
+		// Format errors nicely
+		var errMsgs []string
+		for _, e := range buildErrors {
+			errMsgs = append(errMsgs, e.Error())
+		}
+		return readyFuncs, fmt.Errorf("%d function(s) failed to build:\n  %s",
+			len(buildErrors), strings.Join(errMsgs, "\n  "))
 	}
 
 	logger.Info("Build process complete", "ready", len(readyFuncs))
 	return readyFuncs, nil
+}
+
+// printBuildSummary outputs a formatted summary of build results.
+func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
+	if len(results) == 0 {
+		return
+	}
+
+	// Check if we should use colors
+	useColor := term.IsTerminal(int(os.Stderr.Fd()))
+
+	// Count results by type
+	var built, skipped, failed int
+	for _, r := range results {
+		if r.Success {
+			if r.Skipped {
+				skipped++
+			} else {
+				built++
+			}
+		} else {
+			failed++
+		}
+	}
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "┌─────────────────────────────────────────────────────────────┐")
+	fmt.Fprintln(os.Stderr, "│                      Build Summary                          │")
+	fmt.Fprintln(os.Stderr, "├─────────────────────────────────────────────────────────────┤")
+
+	for _, r := range results {
+		var status, icon, color string
+		var detail string
+
+		if r.Success {
+			if r.Skipped {
+				icon = "○"
+				status = "up-to-date"
+				color = colorDim
+			} else {
+				icon = "✓"
+				status = "built"
+				color = colorGreen
+				if r.Duration > 0 {
+					detail = fmt.Sprintf("(%s)", r.Duration.Round(time.Millisecond))
+				}
+			}
+		} else {
+			icon = "✖"
+			status = "failed"
+			color = colorRed
+			if r.Error != nil {
+				detail = fmt.Sprintf("(%s)", r.Error.Phase)
+			}
+		}
+
+		name := r.Function.Name
+		if len(name) > 24 {
+			name = name[:21] + "..."
+		}
+
+		if useColor {
+			fmt.Fprintf(os.Stderr, "│  %s%s%s %-24s %-12s %s\n",
+				color, icon, colorReset, name, status, detail)
+		} else {
+			fmt.Fprintf(os.Stderr, "│  %s %-24s %-12s %s\n",
+				icon, name, status, detail)
+		}
+	}
+
+	fmt.Fprintln(os.Stderr, "├─────────────────────────────────────────────────────────────┤")
+
+	// Summary line
+	summaryParts := []string{}
+	if built > 0 {
+		if useColor {
+			summaryParts = append(summaryParts, fmt.Sprintf("%s%d built%s", colorGreen, built, colorReset))
+		} else {
+			summaryParts = append(summaryParts, fmt.Sprintf("%d built", built))
+		}
+	}
+	if skipped > 0 {
+		if useColor {
+			summaryParts = append(summaryParts, fmt.Sprintf("%s%d up-to-date%s", colorDim, skipped, colorReset))
+		} else {
+			summaryParts = append(summaryParts, fmt.Sprintf("%d up-to-date", skipped))
+		}
+	}
+	if failed > 0 {
+		if useColor {
+			summaryParts = append(summaryParts, fmt.Sprintf("%s%d failed%s", colorRed, failed, colorReset))
+		} else {
+			summaryParts = append(summaryParts, fmt.Sprintf("%d failed", failed))
+		}
+	}
+
+	summary := strings.Join(summaryParts, ", ")
+	fmt.Fprintf(os.Stderr, "│  Total: %-52s │\n", summary)
+	fmt.Fprintln(os.Stderr, "└─────────────────────────────────────────────────────────────┘")
+	fmt.Fprintln(os.Stderr)
+
+	// Print detailed error messages for failed builds
+	if failed > 0 {
+		fmt.Fprintln(os.Stderr, "Failed builds:")
+		for _, r := range results {
+			if !r.Success && r.Error != nil {
+				if useColor {
+					fmt.Fprintf(os.Stderr, "  %s✖ %s%s: %v\n",
+						colorRed, r.Function.Name, colorReset, r.Error.Err)
+				} else {
+					fmt.Fprintf(os.Stderr, "  ✖ %s: %v\n",
+						r.Function.Name, r.Error.Err)
+				}
+			}
+		}
+		fmt.Fprintln(os.Stderr)
+	}
 }
 
 // ============================================================================
@@ -2346,10 +2957,8 @@ func Execute() {
 }
 
 func init() {
-	// Initialize logger
-	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	// Initialize logger with pretty output
+	logger = slog.New(NewPrettyHandler(os.Stderr, slog.LevelInfo))
 
 	// Register runtime handlers in priority order
 	// Dockerfile first (highest priority), then language-specific handlers
