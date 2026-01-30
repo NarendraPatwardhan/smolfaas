@@ -98,12 +98,15 @@ const (
 	filePermStandard           = 0644
 	filePermExecutable         = 0755
 	containerReadyPollInterval = 500 * time.Millisecond
-	containerReadyTimeout      = 30 * time.Second
 	execSettleDelay            = 100 * time.Millisecond
 	caddyStartupTimeout        = 30 * time.Second
 	buildkitStartupTimeout     = 30 * time.Second
 	maxFunctionNameLength      = 64
+	maxBuildConcurrency        = 4
 )
+
+// validFunctionNameRe matches characters that are NOT allowed in function names.
+var validFunctionNameRe = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
 
 // ============================================================================
 // Global Variables / Configuration
@@ -127,6 +130,27 @@ var (
 	cmdDockerClient *docker.Client
 	logger          *slog.Logger
 )
+
+// App holds the shared runtime state for SmolFaaS commands. It is stored in
+// Cobra's command context to enable testability without mutating package globals.
+type App struct {
+	Ctx          context.Context
+	DockerClient *docker.Client
+}
+
+// appContextKey is the context key for retrieving the App from Cobra commands.
+type appContextKey struct{}
+
+// getApp retrieves the App from a Cobra command's context.
+// Falls back to globals if not set (for backward compatibility).
+func getApp(cmd *cobra.Command) *App {
+	if cmd.Context() != nil {
+		if app, ok := cmd.Context().Value(appContextKey{}).(*App); ok {
+			return app
+		}
+	}
+	return &App{Ctx: cmdCtx, DockerClient: cmdDockerClient}
+}
 
 // ============================================================================
 // Type Definitions
@@ -166,6 +190,7 @@ type FunctionDefinition struct {
 	ContainerName  string         // Container name (e.g., "smolfaas-func-myapp")
 	InternalPort   int            // Port the function listens on (default: 8000)
 	InvocationPath string         // Router path (e.g., "/invoke/myapp")
+	RuntimeVersion string         // Runtime version (from config override or handler default)
 
 	// Build state tracking
 	ContentHash     string    // SHA256 hash of all source files
@@ -209,12 +234,17 @@ func (e *BuildError) Error() string {
 	return fmt.Sprintf("%s: %s failed: %v%s", e.FunctionName, e.Phase, e.Err, suggestion)
 }
 
+// Unwrap returns the underlying error, enabling errors.Is() and errors.As() traversal.
+func (e *BuildError) Unwrap() error {
+	return e.Err
+}
+
 // BuildResult tracks the outcome of building a single function.
 type BuildResult struct {
 	Function    FunctionDefinition
 	Success     bool
 	Skipped     bool   // True if function was up-to-date
-	Error       *BuildError
+	BuildErr    *BuildError
 	Duration    time.Duration
 }
 
@@ -230,8 +260,6 @@ const (
 	colorRed     = "\033[31m"
 	colorGreen   = "\033[32m"
 	colorYellow  = "\033[33m"
-	colorBlue    = "\033[34m"
-	colorMagenta = "\033[35m"
 	colorCyan    = "\033[36m"
 )
 
@@ -448,13 +476,21 @@ func (mpd *MultiProgressDisplay) UpdateBuild(funcName, status, step string, done
 	mpd.render()
 }
 
-// MarkComplete marks a build as complete.
+// MarkComplete marks a build as complete, preserving existing progress counts.
 func (mpd *MultiProgressDisplay) MarkComplete(funcName string, success bool) {
+	mpd.mu.Lock()
+	var done, total int
+	if bp, ok := mpd.builds[funcName]; ok {
+		done = bp.DoneSteps
+		total = bp.TotalSteps
+	}
+	mpd.mu.Unlock()
+
 	status := "complete"
 	if !success {
 		status = "failed"
 	}
-	mpd.UpdateBuild(funcName, status, "", 0, 0)
+	mpd.UpdateBuild(funcName, status, "", done, total)
 }
 
 // render draws the current progress state to the terminal.
@@ -689,10 +725,31 @@ func validateFunctionName(name string) error {
 	if len(name) > maxFunctionNameLength {
 		return fmt.Errorf("function name %q exceeds %d characters", name, maxFunctionNameLength)
 	}
-	if matched, _ := regexp.MatchString(`[^a-zA-Z0-9_.-]`, name); matched {
+	if validFunctionNameRe.MatchString(name) {
 		return fmt.Errorf("function name %q contains invalid characters (allowed: a-z, A-Z, 0-9, _, ., -)", name)
 	}
 	return nil
+}
+
+// FunctionConfig represents optional per-function configuration loaded from
+// a .smolfaas.json file in the function directory.
+type FunctionConfig struct {
+	RuntimeVersion string `json:"runtime_version,omitempty"` // Override the default runtime version
+}
+
+// loadFunctionConfig reads an optional .smolfaas.json file from the function directory.
+// Returns an empty config if the file does not exist.
+func loadFunctionConfig(funcPath string) FunctionConfig {
+	data, err := os.ReadFile(filepath.Join(funcPath, ".smolfaas.json"))
+	if err != nil {
+		return FunctionConfig{}
+	}
+	var cfg FunctionConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		logger.Warn("Invalid .smolfaas.json", "path", funcPath, "error", err)
+		return FunctionConfig{}
+	}
+	return cfg
 }
 
 // ============================================================================
@@ -717,7 +774,7 @@ func (h *GoRuntimeHandler) Detect(directoryPath string) bool {
 func (h *GoRuntimeHandler) GenerateLLB(funcDef FunctionDefinition) (llb.State, error) {
 	logger.Info("Generating Go LLB", "function", funcDef.Name)
 
-	goVersion := h.Version()
+	goVersion := funcDef.RuntimeVersion
 	builderImage := fmt.Sprintf("docker.io/library/golang:%s-alpine", goVersion)
 
 	// Persistent caches for Go module and build artifacts
@@ -822,7 +879,7 @@ func (h *PythonRuntimeHandler) Detect(directoryPath string) bool {
 func (h *PythonRuntimeHandler) GenerateLLB(funcDef FunctionDefinition) (llb.State, error) {
 	logger.Info("Generating Python LLB", "function", funcDef.Name)
 
-	pythonVersion := h.Version()
+	pythonVersion := funcDef.RuntimeVersion
 	pythonImage := fmt.Sprintf("docker.io/library/python:%s-slim", pythonVersion)
 	uvImage := "ghcr.io/astral-sh/uv:latest"
 
@@ -949,7 +1006,7 @@ func (h *NodeRuntimeHandler) Detect(directoryPath string) bool {
 func (h *NodeRuntimeHandler) GenerateLLB(funcDef FunctionDefinition) (llb.State, error) {
 	logger.Info("Generating Node.js LLB", "function", funcDef.Name)
 
-	nodeVersion := h.Version()
+	nodeVersion := funcDef.RuntimeVersion
 	nodeImage := fmt.Sprintf("docker.io/library/node:%s-alpine", nodeVersion)
 
 	// npm cache
@@ -1062,7 +1119,6 @@ func hasBuildScript(sourcePath string) bool {
 	return false
 }
 
-// ============================================================================
 // ============================================================================
 // Dockerfile Runtime Handler (Fallback)
 // ============================================================================
@@ -1203,12 +1259,16 @@ func (hm *HashManager) ComputeHash(dirPath string) (string, error) {
 		hasher.Write([]byte(relPath))
 		hasher.Write([]byte{0}) // Separator
 
-		// Include file content
-		content, err := os.ReadFile(filePath)
+		// Stream file content through hasher
+		f, err := os.Open(filePath)
 		if err != nil {
-			return "", fmt.Errorf("failed to read file %s: %w", filePath, err)
+			return "", fmt.Errorf("failed to open file %s: %w", filePath, err)
 		}
-		hasher.Write(content)
+		if _, err := io.Copy(hasher, f); err != nil {
+			f.Close()
+			return "", fmt.Errorf("failed to hash file %s: %w", filePath, err)
+		}
+		f.Close()
 		hasher.Write([]byte{0}) // Separator
 	}
 
@@ -1494,6 +1554,14 @@ func (fb *FaaSBuilder) discoverFunctions(baseDir string) ([]FunctionDefinition, 
 		}
 
 		if detectedHandler != nil {
+			// Load optional per-function config for version override
+			cfg := loadFunctionConfig(funcPath)
+			runtimeVersion := detectedHandler.Version()
+			if cfg.RuntimeVersion != "" {
+				logger.Info("Using runtime version override", "function", funcName, "version", cfg.RuntimeVersion)
+				runtimeVersion = cfg.RuntimeVersion
+			}
+
 			funcs = append(funcs, FunctionDefinition{
 				Name:           funcName,
 				SourcePath:     funcPath,
@@ -1503,6 +1571,7 @@ func (fb *FaaSBuilder) discoverFunctions(baseDir string) ([]FunctionDefinition, 
 				ContainerName:  fmt.Sprintf("%s-%s", fb.imagePrefix, funcName),
 				InternalPort:   defaultFunctionPort,
 				InvocationPath: fmt.Sprintf("/invoke/%s", funcName),
+				RuntimeVersion: runtimeVersion,
 			})
 		}
 	}
@@ -1570,17 +1639,18 @@ func (fb *FaaSBuilder) checkFunctionIncrementalStatus(funcDef *FunctionDefinitio
 	return nil
 }
 
-// buildAndLoadFunctionImage builds a function image and loads it into Docker.
-// If progressDisplay is provided, it updates that display; otherwise uses standard progressui.
-func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *FunctionDefinition, progressDisplay *MultiProgressDisplay) error {
-	if fb.buildkitMgr == nil || fb.buildkitMgr.buildkitClient == nil {
-		return fmt.Errorf("buildkit client not available")
-	}
-
-	logger.Info("Building function image", "function", funcDef.Name, "image", funcDef.ImageName)
-	startTime := time.Now()
-	ctx := fb.buildkitMgr.ctx
-
+// buildAndLoadImage handles the common pattern of building a Docker image via BuildKit
+// and loading the resulting tar into the Docker daemon. The buildFn receives the fully
+// configured SolveOpt (with exports) and the status channel. The progressFn receives
+// the errgroup context and status channel for progress display.
+func buildAndLoadImage(
+	ctx context.Context,
+	dockerClient *docker.Client,
+	imageName string,
+	solveOpt buildkit.SolveOpt,
+	buildFn func(ctx context.Context, opt buildkit.SolveOpt, ch chan *buildkit.SolveStatus) error,
+	progressFn func(ctx context.Context, ch chan *buildkit.SolveStatus) error,
+) error {
 	pr, pw := io.Pipe()
 	var tarBuffer bytes.Buffer
 	var tarWg sync.WaitGroup
@@ -1588,27 +1658,12 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 
 	exportEntry := buildkit.ExportEntry{
 		Type:  buildkit.ExporterDocker,
-		Attrs: map[string]string{"name": funcDef.ImageName},
+		Attrs: map[string]string{"name": imageName},
 		Output: func(map[string]string) (io.WriteCloser, error) {
 			return pw, nil
 		},
 	}
-	// Check if this is a Dockerfile frontend build
-	useDockerfileFrontend := false
-	if dfh, ok := funcDef.RuntimeHandler.(*DockerfileRuntimeHandler); ok {
-		useDockerfileFrontend = dfh.UsesDockerfileFrontend()
-	}
-
-	solveOpt := buildkit.SolveOpt{
-		Exports:   []buildkit.ExportEntry{exportEntry},
-		LocalDirs: map[string]string{"context": funcDef.SourcePath},
-	}
-
-	if useDockerfileFrontend {
-		// For Dockerfile builds, use the dockerfile frontend directly
-		solveOpt.LocalDirs["dockerfile"] = funcDef.SourcePath
-		solveOpt.Frontend = "dockerfile.v0"
-	}
+	solveOpt.Exports = []buildkit.ExportEntry{exportEntry}
 
 	buildEg, buildCtx := errgroup.WithContext(ctx)
 	ch := make(chan *buildkit.SolveStatus)
@@ -1624,37 +1679,85 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 		return nil
 	})
 
-	// Progress display goroutine - use multi-progress display if available
+	// Progress display goroutine
 	buildEg.Go(func() error {
-		if progressDisplay != nil {
-			// Use the shared multi-progress display
-			progressDisplay.ConsumeStatusChannel(funcDef.Name, ch)
-			return nil
-		}
-		// Fallback to standard progressui for single builds
-		display, err := progressui.NewDisplay(os.Stderr, progressui.AutoMode)
-		if err != nil {
-			// Drain channel if display fails
-			go func() {
-				for range ch {
-				}
-			}()
-			return nil
-		}
-		_, err = display.UpdateFrom(buildCtx, ch)
-		return err
+		return progressFn(buildCtx, ch)
 	})
 
 	// Build goroutine
 	buildEg.Go(func() error {
 		defer pw.Close()
+		return buildFn(buildCtx, solveOpt, ch)
+	})
+
+	if err := buildEg.Wait(); err != nil {
+		return err
+	}
+
+	pw.Close()
+	tarWg.Wait()
+
+	// Load image into Docker
+	resp, err := dockerClient.ImageLoad(ctx, bytes.NewReader(tarBuffer.Bytes()))
+	if err != nil {
+		return fmt.Errorf("failed to load image: %w", err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		logger.Warn("Failed to read image load response", "error", err)
+	}
+
+	return nil
+}
+
+// defaultProgressFn returns a progress function that uses standard progressui output.
+func defaultProgressFn() func(ctx context.Context, ch chan *buildkit.SolveStatus) error {
+	return func(buildCtx context.Context, ch chan *buildkit.SolveStatus) error {
+		display, err := progressui.NewDisplay(os.Stderr, progressui.AutoMode)
+		if err != nil {
+			go func() { for range ch {} }()
+			return nil
+		}
+		_, err = display.UpdateFrom(buildCtx, ch)
+		return err
+	}
+}
+
+// buildAndLoadFunctionImage builds a function image and loads it into Docker.
+// If progressDisplay is provided, it updates that display; otherwise uses standard progressui.
+func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *FunctionDefinition, progressDisplay *MultiProgressDisplay) error {
+	if fb.buildkitMgr == nil || fb.buildkitMgr.buildkitClient == nil {
+		return fmt.Errorf("buildkit client not available")
+	}
+
+	logger.Info("Building function image", "function", funcDef.Name, "image", funcDef.ImageName)
+	startTime := time.Now()
+	ctx := fb.buildkitMgr.ctx
+
+	// Check if this is a Dockerfile frontend build
+	useDockerfileFrontend := false
+	if dfh, ok := funcDef.RuntimeHandler.(*DockerfileRuntimeHandler); ok {
+		useDockerfileFrontend = dfh.UsesDockerfileFrontend()
+	}
+
+	solveOpt := buildkit.SolveOpt{
+		LocalDirs: map[string]string{"context": funcDef.SourcePath},
+	}
+
+	if useDockerfileFrontend {
+		solveOpt.LocalDirs["dockerfile"] = funcDef.SourcePath
+		solveOpt.Frontend = "dockerfile.v0"
+	}
+
+	bkClient := fb.buildkitMgr.buildkitClient
+
+	// Build function: dispatch to Dockerfile frontend or LLB gateway
+	buildFn := func(buildCtx context.Context, opt buildkit.SolveOpt, ch chan *buildkit.SolveStatus) error {
 		if useDockerfileFrontend {
-			// Dockerfile frontend build - no gateway callback needed
-			_, err := fb.buildkitMgr.buildkitClient.Solve(buildCtx, nil, solveOpt, ch)
+			_, err := bkClient.Solve(buildCtx, nil, opt, ch)
 			return err
 		}
-		// LLB-based build using gateway
-		_, err := fb.buildkitMgr.buildkitClient.Build(buildCtx, solveOpt, "",
+		_, err := bkClient.Build(buildCtx, opt, "",
 			func(ctx context.Context, c bkgw.Client) (*bkgw.Result, error) {
 				res, err := c.Solve(ctx, bkgw.SolveRequest{Definition: def.ToPB()})
 				if err != nil {
@@ -1665,32 +1768,29 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 			ch,
 		)
 		return err
-	})
+	}
 
-	if err := buildEg.Wait(); err != nil {
+	// Progress function: use multi-progress display if available
+	progressFn := func(buildCtx context.Context, ch chan *buildkit.SolveStatus) error {
+		if progressDisplay != nil {
+			progressDisplay.ConsumeStatusChannel(funcDef.Name, ch)
+			return nil
+		}
+		display, err := progressui.NewDisplay(os.Stderr, progressui.AutoMode)
+		if err != nil {
+			go func() { for range ch {} }()
+			return nil
+		}
+		_, err = display.UpdateFrom(buildCtx, ch)
+		return err
+	}
+
+	if err := buildAndLoadImage(ctx, fb.buildkitMgr.dockerClient, funcDef.ImageName, solveOpt, buildFn, progressFn); err != nil {
 		if progressDisplay != nil {
 			progressDisplay.MarkComplete(funcDef.Name, false)
 		}
 		return fmt.Errorf("build failed: %w", err)
 	}
-
-	pw.Close()
-	tarWg.Wait()
-
-	// Load image into Docker - preserve final build progress counts
-	if progressDisplay != nil {
-		done, total := progressDisplay.finalCounts.Get(funcDef.Name)
-		progressDisplay.UpdateBuild(funcDef.Name, "building", "Loading image into Docker...", done, total)
-	}
-	resp, err := fb.buildkitMgr.dockerClient.ImageLoad(ctx, bytes.NewReader(tarBuffer.Bytes()))
-	if err != nil {
-		if progressDisplay != nil {
-			progressDisplay.MarkComplete(funcDef.Name, false)
-		}
-		return fmt.Errorf("failed to load image: %w", err)
-	}
-	defer resp.Body.Close()
-	io.ReadAll(resp.Body)
 
 	// Get image ID
 	imgInspect, err := fb.buildkitMgr.dockerClient.ImageInspect(ctx, funcDef.ImageName)
@@ -1751,7 +1851,7 @@ func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefi
 			results = append(results, BuildResult{
 				Function: *fn,
 				Success:  false,
-				Error:    &BuildError{FunctionName: fn.Name, Phase: "hash", Err: err},
+				BuildErr: &BuildError{FunctionName: fn.Name, Phase: "hash", Err: err},
 			})
 			resultsMutex.Unlock()
 			continue
@@ -1781,8 +1881,9 @@ func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefi
 		}
 	}
 
-	// Build functions in parallel
+	// Build functions in parallel with bounded concurrency
 	g, groupCtx := errgroup.WithContext(fb.buildkitMgr.ctx)
+	g.SetLimit(maxBuildConcurrency)
 
 	for _, idx := range toBuild {
 		fnIndex := idx
@@ -1805,7 +1906,7 @@ func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefi
 				results = append(results, BuildResult{
 					Function: *fn,
 					Success:  false,
-					Error:    &BuildError{FunctionName: fn.Name, Phase: "llb", Err: err},
+					BuildErr: &BuildError{FunctionName: fn.Name, Phase: "llb", Err: err},
 					Duration: time.Since(startTime),
 				})
 				resultsMutex.Unlock()
@@ -1822,7 +1923,7 @@ func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefi
 				results = append(results, BuildResult{
 					Function: *fn,
 					Success:  false,
-					Error:    &BuildError{FunctionName: fn.Name, Phase: "marshal", Err: err},
+					BuildErr: &BuildError{FunctionName: fn.Name, Phase: "marshal", Err: err},
 					Duration: time.Since(startTime),
 				})
 				resultsMutex.Unlock()
@@ -1835,7 +1936,7 @@ func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefi
 				results = append(results, BuildResult{
 					Function: *fn,
 					Success:  false,
-					Error:    &BuildError{FunctionName: fn.Name, Phase: "build", Err: err},
+					BuildErr: &BuildError{FunctionName: fn.Name, Phase: "build", Err: err},
 					Duration: time.Since(startTime),
 				})
 				resultsMutex.Unlock()
@@ -1872,8 +1973,8 @@ func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefi
 	for _, r := range results {
 		if r.Success {
 			readyFuncs = append(readyFuncs, r.Function)
-		} else if r.Error != nil {
-			buildErrors = append(buildErrors, r.Error)
+		} else if r.BuildErr != nil {
+			buildErrors = append(buildErrors, r.BuildErr)
 		}
 	}
 
@@ -1941,8 +2042,8 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 			icon = "✖"
 			status = "failed"
 			color = colorRed
-			if r.Error != nil {
-				detail = fmt.Sprintf("(%s)", r.Error.Phase)
+			if r.BuildErr != nil {
+				detail = fmt.Sprintf("(%s)", r.BuildErr.Phase)
 			}
 		}
 
@@ -1995,13 +2096,13 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 	if failed > 0 {
 		fmt.Fprintln(os.Stderr, "Failed builds:")
 		for _, r := range results {
-			if !r.Success && r.Error != nil {
+			if !r.Success && r.BuildErr != nil {
 				if useColor {
 					fmt.Fprintf(os.Stderr, "  %s✖ %s%s: %v\n",
-						colorRed, r.Function.Name, colorReset, r.Error.Err)
+						colorRed, r.Function.Name, colorReset, r.BuildErr.Err)
 				} else {
 					fmt.Fprintf(os.Stderr, "  ✖ %s: %v\n",
-						r.Function.Name, r.Error.Err)
+						r.Function.Name, r.BuildErr.Err)
 				}
 			}
 		}
@@ -2231,52 +2332,10 @@ func (cm *CaddyManager) BuildRouterImage(buildkitMgr *BuildkitManager, hostname 
 		return fmt.Errorf("failed to marshal LLB: %w", err)
 	}
 
-	ctx := cm.ctx
-	pr, pw := io.Pipe()
-	var tarBuffer bytes.Buffer
-	var tarWg sync.WaitGroup
-	tarWg.Add(1)
+	solveOpt := buildkit.SolveOpt{}
 
-	exportEntry := buildkit.ExportEntry{
-		Type:  buildkit.ExporterDocker,
-		Attrs: map[string]string{"name": cm.routerImageName},
-		Output: func(map[string]string) (io.WriteCloser, error) {
-			return pw, nil
-		},
-	}
-	solveOpt := buildkit.SolveOpt{
-		Exports: []buildkit.ExportEntry{exportEntry},
-	}
-
-	buildEg, buildCtx := errgroup.WithContext(ctx)
-	ch := make(chan *buildkit.SolveStatus)
-
-	buildEg.Go(func() error {
-		defer tarWg.Done()
-		defer pr.Close()
-		_, err := io.Copy(&tarBuffer, pr)
-		if err != nil && err != io.ErrClosedPipe {
-			return err
-		}
-		return nil
-	})
-
-	buildEg.Go(func() error {
-		display, err := progressui.NewDisplay(os.Stderr, progressui.AutoMode)
-		if err != nil {
-			go func() {
-				for range ch {
-				}
-			}()
-			return nil
-		}
-		_, err = display.UpdateFrom(buildCtx, ch)
-		return err
-	})
-
-	buildEg.Go(func() error {
-		defer pw.Close()
-		_, err := buildkitMgr.buildkitClient.Build(buildCtx, solveOpt, "",
+	buildFn := func(buildCtx context.Context, opt buildkit.SolveOpt, ch chan *buildkit.SolveStatus) error {
+		_, err := buildkitMgr.buildkitClient.Build(buildCtx, opt, "",
 			func(ctx context.Context, c bkgw.Client) (*bkgw.Result, error) {
 				res, err := c.Solve(ctx, bkgw.SolveRequest{Definition: def.ToPB()})
 				if err != nil {
@@ -2287,21 +2346,13 @@ func (cm *CaddyManager) BuildRouterImage(buildkitMgr *BuildkitManager, hostname 
 			ch,
 		)
 		return err
-	})
+	}
 
-	if err := buildEg.Wait(); err != nil {
+	progressFn := defaultProgressFn()
+
+	if err := buildAndLoadImage(cm.ctx, cm.dockerClient, cm.routerImageName, solveOpt, buildFn, progressFn); err != nil {
 		return fmt.Errorf("failed to build Caddy image: %w", err)
 	}
-
-	pw.Close()
-	tarWg.Wait()
-
-	resp, err := cm.dockerClient.ImageLoad(ctx, bytes.NewReader(tarBuffer.Bytes()))
-	if err != nil {
-		return fmt.Errorf("failed to load Caddy image: %w", err)
-	}
-	defer resp.Body.Close()
-	io.ReadAll(resp.Body)
 
 	logger.Info("Caddy router image built", "image", cm.routerImageName)
 	return nil
@@ -2401,12 +2452,43 @@ func (cm *CaddyManager) Start() error {
 		return nil
 	}
 
-	// Wait for Caddy to initialize
+	// Wait for Caddy to initialize - first check container is running, then poll admin API
 	if err := waitForContainerReady(cm.ctx, cm.dockerClient, cm.containerName, caddyStartupTimeout); err != nil {
 		return fmt.Errorf("caddy router failed to start: %w", err)
 	}
+	if err := cm.waitForCaddyReady(); err != nil {
+		return fmt.Errorf("caddy admin API not ready: %w", err)
+	}
 	logger.Info("Caddy router started", "id", containerID[:12])
 	return nil
+}
+
+// waitForCaddyReady polls the Caddy admin API until it responds successfully.
+// This ensures Caddy is fully initialized before attempting to add routes.
+func (cm *CaddyManager) waitForCaddyReady() error {
+	ctx, cancel := context.WithTimeout(cm.ctx, caddyStartupTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(containerReadyPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for Caddy admin API to be ready")
+		case <-ticker.C:
+			stdout, _, err := cm.execInCaddyContainer(
+				"curl", "-sf", fmt.Sprintf("http://%s/config/", cm.adminAPIAddr),
+			)
+			if err != nil {
+				continue
+			}
+			// Any non-error response means the admin API is ready
+			if stdout != "" || err == nil {
+				return nil
+			}
+		}
+	}
 }
 
 // CaddyRoute represents a route configuration for Caddy's admin API.
@@ -2671,11 +2753,13 @@ func pruneDanglingImages(ctx context.Context, client *docker.Client) error {
 
 // ConsistencyChecker verifies the consistency of SmolFaaS state.
 type ConsistencyChecker struct {
-	dockerClient *docker.Client
-	hashMgr      *HashManager
-	ctx          context.Context
-	imagePrefix  string
-	functionsDir string
+	dockerClient       *docker.Client
+	hashMgr            *HashManager
+	ctx                context.Context
+	imagePrefix        string
+	functionsDir       string
+	caddyContainerName string
+	networkName        string
 }
 
 // CheckResult represents the result of a consistency check for a function.
@@ -2691,11 +2775,42 @@ type CheckResult struct {
 	RouteMessage      string
 }
 
+// fetchCaddyRouteIDs queries the Caddy admin API for current route IDs.
+// Returns a set of route IDs or nil if Caddy is not reachable.
+func (cc *ConsistencyChecker) fetchCaddyRouteIDs() map[string]bool {
+	caddyMgr, err := NewCaddyManager(cc.ctx, cc.dockerClient, cc.caddyContainerName, cc.networkName)
+	if err != nil {
+		return nil
+	}
+	stdout, _, err := caddyMgr.execInCaddyContainer(
+		"curl", "-sf", fmt.Sprintf("http://%s/config/apps/http/servers/srv0/routes/0/handle/0/routes", caddyMgr.adminAPIAddr),
+	)
+	if err != nil {
+		return nil
+	}
+
+	var routes []struct {
+		ID string `json:"@id"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &routes); err != nil {
+		return nil
+	}
+
+	routeIDs := make(map[string]bool)
+	for _, r := range routes {
+		routeIDs[r.ID] = true
+	}
+	return routeIDs
+}
+
 // RunCheck performs a consistency check on all functions.
 func (cc *ConsistencyChecker) RunCheck() ([]CheckResult, error) {
 	logger.Info("Running consistency check")
 
 	var results []CheckResult
+
+	// Fetch current Caddy routes for route verification
+	routeIDs := cc.fetchCaddyRouteIDs()
 
 	// Get all stored states
 	states, err := cc.hashMgr.GetAllStates()
@@ -2802,6 +2917,19 @@ func (cc *ConsistencyChecker) RunCheck() ([]CheckResult, error) {
 			}
 		}
 
+		// Check route
+		expectedRouteID := "smolfaas-func-" + funcName
+		if routeIDs == nil {
+			result.RouteOK = false
+			result.RouteMessage = "Caddy not reachable"
+		} else if routeIDs[expectedRouteID] {
+			result.RouteOK = true
+			result.RouteMessage = "Route configured"
+		} else {
+			result.RouteOK = false
+			result.RouteMessage = "Route not found in Caddy"
+		}
+
 		results = append(results, result)
 		delete(stateMap, funcName)
 	}
@@ -2832,7 +2960,11 @@ var rootCmd = &cobra.Command{
 	Long:  `SmolFaaS builds function images via BuildKit and manages a Caddy router.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		logger.Info("Initializing SmolFaaS")
-		cmdCtx = context.Background()
+		// Use the signal-aware context from main() if available, otherwise fall back
+		cmdCtx = cmd.Context()
+		if cmdCtx == nil {
+			cmdCtx = context.Background()
+		}
 
 		var err error
 		cmdDockerClient, err = docker.NewClientWithOpts(docker.FromEnv, docker.WithAPIVersionNegotiation())
@@ -2841,6 +2973,10 @@ var rootCmd = &cobra.Command{
 		}
 
 		buildkitCacheVolumeName = buildkitContainerName + "-cache"
+
+		// Store App in context for testability
+		app := &App{Ctx: cmdCtx, DockerClient: cmdDockerClient}
+		cmd.SetContext(context.WithValue(cmdCtx, appContextKey{}, app))
 
 		// Ensure network exists
 		_, err = cmdDockerClient.NetworkInspect(cmdCtx, networkName, network.InspectOptions{})
@@ -2963,9 +3099,9 @@ Use --force for full cleanup including volumes, network, and dangling images.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		logger.Info("--- Running SmolFaaS Down ---")
 
-		hashMgr, err := NewHashManager(stateDBPath)
-		if err != nil {
-			logger.Warn("Failed to init HashManager", "error", err)
+		hashMgr, hashErr := NewHashManager(stateDBPath)
+		if hashErr != nil {
+			logger.Warn("Failed to init HashManager", "error", hashErr)
 		}
 		defer func() {
 			if hashMgr != nil {
@@ -2973,14 +3109,14 @@ Use --force for full cleanup including volumes, network, and dangling images.`,
 			}
 		}()
 
-		funcMgr, err := NewFunctionManager(cmdCtx, cmdDockerClient, networkName)
-		if err != nil {
-			logger.Warn("Failed to init FunctionManager", "error", err)
+		funcMgr, funcErr := NewFunctionManager(cmdCtx, cmdDockerClient, networkName)
+		if funcErr != nil {
+			logger.Warn("Failed to init FunctionManager", "error", funcErr)
 		}
 
-		caddyMgr, err := NewCaddyManager(cmdCtx, cmdDockerClient, caddyContainerName, networkName)
-		if err != nil {
-			logger.Warn("Failed to init CaddyManager", "error", err)
+		caddyMgr, caddyErr := NewCaddyManager(cmdCtx, cmdDockerClient, caddyContainerName, networkName)
+		if caddyErr != nil {
+			logger.Warn("Failed to init CaddyManager", "error", caddyErr)
 		}
 
 		if len(args) == 0 {
@@ -3055,11 +3191,13 @@ var checkCmd = &cobra.Command{
 		defer hashMgr.Close()
 
 		checker := &ConsistencyChecker{
-			dockerClient: cmdDockerClient,
-			hashMgr:      hashMgr,
-			ctx:          cmdCtx,
-			imagePrefix:  faasImagePrefix,
-			functionsDir: functionsDir,
+			dockerClient:       cmdDockerClient,
+			hashMgr:            hashMgr,
+			ctx:                cmdCtx,
+			imagePrefix:        faasImagePrefix,
+			functionsDir:       functionsDir,
+			caddyContainerName: caddyContainerName,
+			networkName:        networkName,
 		}
 
 		results, err := checker.RunCheck()
@@ -3092,6 +3230,12 @@ var checkCmd = &cobra.Command{
 				fmt.Printf("  ✓ %s\n", r.ImageMessage)
 			} else {
 				fmt.Printf("  ✗ %s\n", r.ImageMessage)
+			}
+
+			if r.RouteOK {
+				fmt.Printf("  ✓ %s\n", r.RouteMessage)
+			} else {
+				fmt.Printf("  ✗ %s\n", r.RouteMessage)
 			}
 		}
 
@@ -3152,5 +3296,7 @@ func main() {
 		logger.Info("Received shutdown signal, cleaning up...")
 	}()
 
+	// Propagate signal-aware context to all Cobra commands
+	rootCmd.SetContext(ctx)
 	Execute()
 }
