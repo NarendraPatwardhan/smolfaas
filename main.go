@@ -53,10 +53,13 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -78,6 +81,28 @@ import (
 	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
+)
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const (
+	defaultFunctionPort        = 8000
+	defaultStopTimeout         = 10
+	defaultCaddyAdminAddr      = "localhost:2019"
+	defaultCaddyImage          = "caddy:latest"
+	defaultBuildkitImage       = "moby/buildkit:latest"
+	defaultHTTPPort            = 80
+	defaultHTTPSPort           = 443
+	filePermStandard           = 0644
+	filePermExecutable         = 0755
+	containerReadyPollInterval = 500 * time.Millisecond
+	containerReadyTimeout      = 30 * time.Second
+	execSettleDelay            = 100 * time.Millisecond
+	caddyStartupTimeout        = 30 * time.Second
+	buildkitStartupTimeout     = 30 * time.Second
+	maxFunctionNameLength      = 64
 )
 
 // ============================================================================
@@ -170,7 +195,18 @@ type BuildError struct {
 }
 
 func (e *BuildError) Error() string {
-	return fmt.Sprintf("%s: %s failed: %v", e.FunctionName, e.Phase, e.Err)
+	var suggestion string
+	switch e.Phase {
+	case "hash":
+		suggestion = " (check file permissions)"
+	case "llb":
+		suggestion = " (verify runtime configuration)"
+	case "marshal":
+		suggestion = " (check LLB definition)"
+	case "build":
+		suggestion = " (check build logs above)"
+	}
+	return fmt.Sprintf("%s: %s failed: %v%s", e.FunctionName, e.Phase, e.Err, suggestion)
 }
 
 // BuildResult tracks the outcome of building a single function.
@@ -201,10 +237,12 @@ const (
 
 // PrettyHandler implements slog.Handler with attractive colored output.
 type PrettyHandler struct {
-	out      io.Writer
-	level    slog.Level
-	mu       sync.Mutex
-	useColor bool
+	out          io.Writer
+	level        slog.Level
+	mu           sync.Mutex
+	useColor     bool
+	preformatted []slog.Attr
+	group        string
 }
 
 // NewPrettyHandler creates a new PrettyHandler that writes to the given output.
@@ -265,20 +303,34 @@ func (h *PrettyHandler) Handle(_ context.Context, r slog.Record) error {
 		buf.WriteString(r.Message)
 	}
 
-	// Add attributes
-	r.Attrs(func(a slog.Attr) bool {
+	// Helper to write a single attribute
+	writeAttr := func(a slog.Attr) {
 		buf.WriteString("  ")
+		key := a.Key
+		if h.group != "" {
+			key = h.group + "." + key
+		}
 		if h.useColor {
 			buf.WriteString(colorDim)
-			buf.WriteString(a.Key)
+			buf.WriteString(key)
 			buf.WriteString("=")
 			buf.WriteString(colorReset)
 			buf.WriteString(a.Value.String())
 		} else {
-			buf.WriteString(a.Key)
+			buf.WriteString(key)
 			buf.WriteString("=")
 			buf.WriteString(a.Value.String())
 		}
+	}
+
+	// Add preformatted attributes
+	for _, a := range h.preformatted {
+		writeAttr(a)
+	}
+
+	// Add record attributes
+	r.Attrs(func(a slog.Attr) bool {
+		writeAttr(a)
 		return true
 	})
 
@@ -288,11 +340,33 @@ func (h *PrettyHandler) Handle(_ context.Context, r slog.Record) error {
 }
 
 func (h *PrettyHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return h // Simplified: ignore group attrs for now
+	newPreformatted := make([]slog.Attr, len(h.preformatted)+len(attrs))
+	copy(newPreformatted, h.preformatted)
+	copy(newPreformatted[len(h.preformatted):], attrs)
+	return &PrettyHandler{
+		out:          h.out,
+		level:        h.level,
+		useColor:     h.useColor,
+		preformatted: newPreformatted,
+		group:        h.group,
+	}
 }
 
 func (h *PrettyHandler) WithGroup(name string) slog.Handler {
-	return h // Simplified: ignore groups for now
+	if name == "" {
+		return h
+	}
+	newGroup := name
+	if h.group != "" {
+		newGroup = h.group + "." + name
+	}
+	return &PrettyHandler{
+		out:          h.out,
+		level:        h.level,
+		useColor:     h.useColor,
+		preformatted: h.preformatted,
+		group:        newGroup,
+	}
 }
 
 // ============================================================================
@@ -320,6 +394,7 @@ type MultiProgressDisplay struct {
 	isTTY        bool
 	lastLines    int // Number of lines printed last render (for clearing)
 	startTime    time.Time
+	finalCounts  *BuildFinalCounts // Tracks final vertex counts for transfer phase
 }
 
 // NewMultiProgressDisplay creates a new multi-progress display.
@@ -331,11 +406,12 @@ func NewMultiProgressDisplay(out io.Writer) *MultiProgressDisplay {
 		useColor = isTTY
 	}
 	return &MultiProgressDisplay{
-		builds:    make(map[string]*BuildProgress),
-		out:       out,
-		useColor:  useColor,
-		isTTY:     isTTY,
-		startTime: time.Now(),
+		builds:      make(map[string]*BuildProgress),
+		out:         out,
+		useColor:    useColor,
+		isTTY:       isTTY,
+		startTime:   time.Now(),
+		finalCounts: &BuildFinalCounts{counts: make(map[string][2]int)},
 	}
 }
 
@@ -505,6 +581,29 @@ func (mpd *MultiProgressDisplay) Finish() {
 	}
 }
 
+// BuildFinalCounts stores the final vertex counts after a build's status channel closes.
+type BuildFinalCounts struct {
+	mu    sync.Mutex
+	counts map[string][2]int // funcName -> [done, total]
+}
+
+// Set stores the final counts for a function build.
+func (bfc *BuildFinalCounts) Set(funcName string, done, total int) {
+	bfc.mu.Lock()
+	defer bfc.mu.Unlock()
+	bfc.counts[funcName] = [2]int{done, total}
+}
+
+// Get retrieves the final counts for a function build.
+func (bfc *BuildFinalCounts) Get(funcName string) (int, int) {
+	bfc.mu.Lock()
+	defer bfc.mu.Unlock()
+	if c, ok := bfc.counts[funcName]; ok {
+		return c[0], c[1]
+	}
+	return 0, 0
+}
+
 // ConsumeStatusChannel reads from a BuildKit status channel and updates progress.
 // This runs in a goroutine for each build.
 func (mpd *MultiProgressDisplay) ConsumeStatusChannel(funcName string, ch chan *buildkit.SolveStatus) {
@@ -553,6 +652,11 @@ func (mpd *MultiProgressDisplay) ConsumeStatusChannel(funcName string, ch chan *
 
 		mpd.UpdateBuild(funcName, "building", currentStep, doneVertices, totalVertices)
 	}
+
+	// Store final counts so the transfer phase can preserve progress
+	if mpd.finalCounts != nil {
+		mpd.finalCounts.Set(funcName, doneVertices, totalVertices)
+	}
 }
 
 // ============================================================================
@@ -563,15 +667,32 @@ func (mpd *MultiProgressDisplay) ConsumeStatusChannel(funcName string, ch chan *
 // Handlers are registered in init() and checked in priority order during detection.
 var runtimeRegistry []RuntimeHandler
 
+// runtimeRegistryMu protects concurrent access to the runtime registry.
+var runtimeRegistryMu sync.Mutex
+
 // registerRuntime adds a handler to the global registry.
 // Called during init() to register all supported runtimes.
 func registerRuntime(handler RuntimeHandler) {
+	runtimeRegistryMu.Lock()
+	defer runtimeRegistryMu.Unlock()
+
 	if handler == nil || handler.ID() == "" {
 		logger.Error("Cannot register nil or ID-less RuntimeHandler")
 		os.Exit(1)
 	}
 	logger.Debug("Registering runtime handler", "runtime", handler.ID())
 	runtimeRegistry = append(runtimeRegistry, handler)
+}
+
+// validateFunctionName checks that a function name is valid for use as a Docker container name.
+func validateFunctionName(name string) error {
+	if len(name) > maxFunctionNameLength {
+		return fmt.Errorf("function name %q exceeds %d characters", name, maxFunctionNameLength)
+	}
+	if matched, _ := regexp.MatchString(`[^a-zA-Z0-9_.-]`, name); matched {
+		return fmt.Errorf("function name %q contains invalid characters (allowed: a-z, A-Z, 0-9, _, ., -)", name)
+	}
+	return nil
 }
 
 // ============================================================================
@@ -714,7 +835,7 @@ func (h *PythonRuntimeHandler) GenerateLLB(funcDef FunctionDefinition) (llb.Stat
 
 	// Setup Python base with uv
 	pythonBase := llb.Image(pythonImage, llb.WithCustomName(fmt.Sprintf("Python %s Slim", pythonVersion)))
-	mode := fs.FileMode(0755)
+	mode := fs.FileMode(filePermExecutable)
 	pythonWithUV := pythonBase.File(
 		llb.Copy(uvBase, "/uv", "/usr/local/bin/uv", &llb.CopyInfo{CreateDestPath: true, Mode: &llb.ChmodOpt{Mode: mode}}),
 		llb.WithCustomName("Copy uv binary"),
@@ -959,45 +1080,26 @@ func (h *DockerfileRuntimeHandler) Detect(directoryPath string) bool {
 	return err == nil
 }
 
+// GenerateLLB for Dockerfile builds returns a placeholder state.
+// The actual build uses the dockerfile frontend via BuildKit, not LLB directly.
+// See buildAndLoadFunctionImage for the frontend-based build path.
 func (h *DockerfileRuntimeHandler) GenerateLLB(funcDef FunctionDefinition) (llb.State, error) {
-	logger.Info("Generating Dockerfile LLB", "function", funcDef.Name)
+	logger.Info("Dockerfile build will use frontend", "function", funcDef.Name)
 
-	// Read Dockerfile content
+	// Verify Dockerfile exists
 	dockerfilePath := filepath.Join(funcDef.SourcePath, "Dockerfile")
-	dockerfileContent, err := os.ReadFile(dockerfilePath)
-	if err != nil {
-		return llb.Scratch(), fmt.Errorf("failed to read Dockerfile: %w", err)
+	if _, err := os.Stat(dockerfilePath); err != nil {
+		return llb.Scratch(), fmt.Errorf("failed to find Dockerfile: %w", err)
 	}
 
-	// For Dockerfile-based builds, we use a simpler approach:
-	// Build context with Dockerfile and let BuildKit handle it natively
-	// This requires using the dockerfile frontend in the build call
+	// Return scratch - the actual build bypasses LLB and uses the dockerfile frontend
+	return llb.Scratch(), nil
+}
 
-	// Source context
-	srcPathRel, err := filepath.Rel(".", funcDef.SourcePath)
-	if err != nil {
-		srcPathRel = funcDef.SourcePath
-	}
-	localSourceOpts := []llb.LocalOption{
-		llb.IncludePatterns([]string{"**/*"}),
-		llb.ExcludePatterns([]string{"**/.*", "**/.git"}),
-		llb.SharedKeyHint(srcPathRel),
-		llb.LocalUniqueID(srcPathRel),
-	}
-	funcSource := llb.Local("context", localSourceOpts...)
-
-	// Create a state that copies the build context
-	// The actual Dockerfile build will be handled by BuildKit's dockerfile frontend
-	// For now, we create a marker state that indicates this needs Dockerfile build
-	buildStage := llb.Scratch().File(
-		llb.Copy(funcSource, ".", "/build-context/", &llb.CopyInfo{CopyDirContentsOnly: true, CreateDestPath: true, AllowWildcard: true}),
-		llb.WithCustomName("Prepare Dockerfile build context"),
-	)
-
-	// Add Dockerfile content as metadata (this is a workaround)
-	_ = dockerfileContent
-
-	return buildStage, nil
+// UsesDockerfileFrontend returns true if this runtime uses BuildKit's dockerfile frontend
+// instead of LLB-based builds.
+func (h *DockerfileRuntimeHandler) UsesDockerfileFrontend() bool {
+	return true
 }
 
 func (h *DockerfileRuntimeHandler) Cmd() []string {
@@ -1022,7 +1124,7 @@ func NewHashManager(dbPath string) (*HashManager, error) {
 	logger.Info("Initializing HashManager", "path", dbPath)
 
 	// Ensure parent directory exists
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), filePermExecutable); err != nil {
 		return nil, fmt.Errorf("failed to create database directory: %w", err)
 	}
 
@@ -1202,7 +1304,7 @@ func NewBuildkitManager(ctx context.Context, dockerClient *docker.Client, contai
 	return &BuildkitManager{
 		dockerClient:    dockerClient,
 		ctx:             ctx,
-		buildkitImage:   "moby/buildkit:latest",
+		buildkitImage:   defaultBuildkitImage,
 		containerName:   containerName,
 		cacheVolumeName: cacheVolumeName,
 	}, nil
@@ -1212,25 +1314,9 @@ func NewBuildkitManager(ctx context.Context, dockerClient *docker.Client, contai
 func (bm *BuildkitManager) ensureBuildkitRunning() error {
 	logger.Info("Ensuring BuildKit daemon is running", "container", bm.containerName)
 
-	// Check if container exists and is running
-	contJSON, err := bm.dockerClient.ContainerInspect(bm.ctx, bm.containerName)
-	if err == nil {
-		if contJSON.State.Running {
-			logger.Info("BuildKit container already running")
-			return nil
-		}
-		// Container exists but not running - remove it
-		logger.Info("Removing stopped BuildKit container")
-		if err := bm.dockerClient.ContainerRemove(bm.ctx, bm.containerName, container.RemoveOptions{Force: true}); err != nil {
-			logger.Warn("Failed to remove existing container", "error", err)
-		}
-	} else if !docker.IsErrNotFound(err) {
-		return fmt.Errorf("failed to inspect container: %w", err)
-	}
-
 	// Ensure cache volume exists
 	logger.Info("Ensuring cache volume exists", "volume", bm.cacheVolumeName)
-	_, err = bm.dockerClient.VolumeCreate(bm.ctx, volume.CreateOptions{Name: bm.cacheVolumeName})
+	_, err := bm.dockerClient.VolumeCreate(bm.ctx, volume.CreateOptions{Name: bm.cacheVolumeName})
 	if err != nil && !strings.Contains(err.Error(), "already exists") {
 		return fmt.Errorf("failed to create cache volume: %w", err)
 	}
@@ -1251,8 +1337,6 @@ func (bm *BuildkitManager) ensureBuildkitRunning() error {
 		}
 	}
 
-	// Create container
-	logger.Info("Creating BuildKit container")
 	containerConfig := &container.Config{
 		Image: bm.buildkitImage,
 	}
@@ -1267,22 +1351,55 @@ func (bm *BuildkitManager) ensureBuildkitRunning() error {
 		},
 	}
 
-	resp, err := bm.dockerClient.ContainerCreate(bm.ctx, containerConfig, hostConfig, nil, nil, bm.containerName)
+	containerID, alreadyRunning, err := ensureContainerRunning(bm.ctx, bm.dockerClient, bm.containerName, containerConfig, hostConfig, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create container: %w", err)
+		return fmt.Errorf("failed to ensure BuildKit container: %w", err)
 	}
 
-	// Start container
-	logger.Info("Starting BuildKit container", "id", resp.ID[:12])
-	if err := bm.dockerClient.ContainerStart(bm.ctx, resp.ID, container.StartOptions{}); err != nil {
-		bm.dockerClient.ContainerRemove(bm.ctx, resp.ID, container.RemoveOptions{Force: true})
-		return fmt.Errorf("failed to start container: %w", err)
+	if alreadyRunning {
+		logger.Info("BuildKit container already running")
+		return nil
 	}
 
-	// Wait for daemon to initialize
-	time.Sleep(time.Second)
+	logger.Info("BuildKit container started", "id", containerID[:12])
+
+	// Wait for the buildkitd daemon socket to become available inside the container.
+	// The container is running, but buildkitd needs time to initialize its gRPC socket.
+	if err := bm.waitForBuildkitDaemon(); err != nil {
+		return fmt.Errorf("buildkit daemon failed to start: %w", err)
+	}
 	logger.Info("BuildKit daemon started")
 	return nil
+}
+
+// waitForBuildkitDaemon polls until the BuildKit daemon inside the container is ready
+// by attempting to establish a client connection.
+func (bm *BuildkitManager) waitForBuildkitDaemon() error {
+	ctx, cancel := context.WithTimeout(bm.ctx, buildkitStartupTimeout)
+	defer cancel()
+
+	buildkitHost := fmt.Sprintf("docker-container://%s", bm.containerName)
+	ticker := time.NewTicker(containerReadyPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for BuildKit daemon to be ready")
+		case <-ticker.C:
+			client, err := buildkit.New(ctx, buildkitHost)
+			if err != nil {
+				continue
+			}
+			// Verify the connection works by listing workers
+			_, err = client.ListWorkers(ctx)
+			client.Close()
+			if err != nil {
+				continue
+			}
+			return nil
+		}
+	}
 }
 
 // connectToBuildkit establishes a client connection to the BuildKit daemon.
@@ -1318,26 +1435,9 @@ func (bm *BuildkitManager) shutdown() error {
 // StopAndRemoveDaemon stops and removes the BuildKit daemon container.
 func (bm *BuildkitManager) StopAndRemoveDaemon() error {
 	logger.Info("Stopping BuildKit daemon", "container", bm.containerName)
-
-	contJSON, err := bm.dockerClient.ContainerInspect(bm.ctx, bm.containerName)
-	if err != nil {
-		if docker.IsErrNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to inspect container: %w", err)
+	if err := stopAndRemoveContainer(bm.ctx, bm.dockerClient, bm.containerName); err != nil {
+		return err
 	}
-
-	if contJSON.State.Running {
-		timeout := 10
-		if err := bm.dockerClient.ContainerStop(bm.ctx, contJSON.ID, container.StopOptions{Timeout: &timeout}); err != nil {
-			logger.Warn("Failed to stop container gracefully", "error", err)
-		}
-	}
-
-	if err := bm.dockerClient.ContainerRemove(bm.ctx, contJSON.ID, container.RemoveOptions{Force: true}); err != nil {
-		return fmt.Errorf("failed to remove container: %w", err)
-	}
-
 	logger.Info("BuildKit daemon stopped and removed")
 	return nil
 }
@@ -1376,6 +1476,10 @@ func (fb *FaaSBuilder) discoverFunctions(baseDir string) ([]FunctionDefinition, 
 		}
 
 		funcName := entry.Name()
+		if err := validateFunctionName(funcName); err != nil {
+			logger.Warn("Skipping invalid function", "name", funcName, "error", err)
+			continue
+		}
 		funcPath := filepath.Join(baseDir, funcName)
 
 		// Check each runtime handler in priority order
@@ -1397,7 +1501,7 @@ func (fb *FaaSBuilder) discoverFunctions(baseDir string) ([]FunctionDefinition, 
 				RuntimeHandler: detectedHandler,
 				ImageName:      fmt.Sprintf("%s-%s:latest", fb.imagePrefix, funcName),
 				ContainerName:  fmt.Sprintf("%s-%s", fb.imagePrefix, funcName),
-				InternalPort:   8000,
+				InternalPort:   defaultFunctionPort,
 				InvocationPath: fmt.Sprintf("/invoke/%s", funcName),
 			})
 		}
@@ -1489,9 +1593,21 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 			return pw, nil
 		},
 	}
+	// Check if this is a Dockerfile frontend build
+	useDockerfileFrontend := false
+	if dfh, ok := funcDef.RuntimeHandler.(*DockerfileRuntimeHandler); ok {
+		useDockerfileFrontend = dfh.UsesDockerfileFrontend()
+	}
+
 	solveOpt := buildkit.SolveOpt{
 		Exports:   []buildkit.ExportEntry{exportEntry},
 		LocalDirs: map[string]string{"context": funcDef.SourcePath},
+	}
+
+	if useDockerfileFrontend {
+		// For Dockerfile builds, use the dockerfile frontend directly
+		solveOpt.LocalDirs["dockerfile"] = funcDef.SourcePath
+		solveOpt.Frontend = "dockerfile.v0"
 	}
 
 	buildEg, buildCtx := errgroup.WithContext(ctx)
@@ -1532,6 +1648,12 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 	// Build goroutine
 	buildEg.Go(func() error {
 		defer pw.Close()
+		if useDockerfileFrontend {
+			// Dockerfile frontend build - no gateway callback needed
+			_, err := fb.buildkitMgr.buildkitClient.Solve(buildCtx, nil, solveOpt, ch)
+			return err
+		}
+		// LLB-based build using gateway
 		_, err := fb.buildkitMgr.buildkitClient.Build(buildCtx, solveOpt, "",
 			func(ctx context.Context, c bkgw.Client) (*bkgw.Result, error) {
 				res, err := c.Solve(ctx, bkgw.SolveRequest{Definition: def.ToPB()})
@@ -1555,9 +1677,10 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 	pw.Close()
 	tarWg.Wait()
 
-	// Load image into Docker
+	// Load image into Docker - preserve final build progress counts
 	if progressDisplay != nil {
-		progressDisplay.UpdateBuild(funcDef.Name, "building", "Loading image into Docker...", 0, 0)
+		done, total := progressDisplay.finalCounts.Get(funcDef.Name)
+		progressDisplay.UpdateBuild(funcDef.Name, "building", "Loading image into Docker...", done, total)
 	}
 	resp, err := fb.buildkitMgr.dockerClient.ImageLoad(ctx, bytes.NewReader(tarBuffer.Bytes()))
 	if err != nil {
@@ -1769,6 +1892,7 @@ func (fb *FaaSBuilder) BuildAndCheckAllFunctions(baseDir string) ([]FunctionDefi
 }
 
 // printBuildSummary outputs a formatted summary of build results.
+// Note: This intentionally uses fmt.Fprintf to stderr (not logger) for formatted table output.
 func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 	if len(results) == 0 {
 		return
@@ -1923,34 +2047,13 @@ func (fm *FunctionManager) StartAll(functions []FunctionDefinition) error {
 		g.Go(func() error {
 			logger.Info("Starting container", "name", funcDef.ContainerName)
 
-			// Check if container exists
-			contInspect, err := fm.dockerClient.ContainerInspect(groupCtx, funcDef.ContainerName)
-			if err == nil {
-				if contInspect.State.Running {
-					logger.Info("Container already running", "name", funcDef.ContainerName)
-					return nil
-				}
-				// Remove stopped container
-				if err := fm.dockerClient.ContainerRemove(groupCtx, contInspect.ID, container.RemoveOptions{Force: true}); err != nil {
-					return fmt.Errorf("failed to remove existing container: %w", err)
-				}
-			} else if !docker.IsErrNotFound(err) {
-				return fmt.Errorf("failed to inspect container: %w", err)
-			}
-
-			// Create container configuration
 			exposedPort, _ := nat.NewPort("tcp", fmt.Sprintf("%d", funcDef.InternalPort))
-
-			containerCmd := funcDef.RuntimeHandler.Cmd()
-			containerEnv := []string{
-				fmt.Sprintf("PORT=%d", funcDef.InternalPort),
-			}
 
 			containerCfg := &container.Config{
 				Image:        funcDef.ImageName,
 				WorkingDir:   "/app",
-				Cmd:          containerCmd,
-				Env:          containerEnv,
+				Cmd:          funcDef.RuntimeHandler.Cmd(),
+				Env:          []string{fmt.Sprintf("PORT=%d", funcDef.InternalPort)},
 				ExposedPorts: nat.PortSet{exposedPort: struct{}{}},
 				Labels: map[string]string{
 					"com.smolfaas.function": funcDef.Name,
@@ -1968,18 +2071,16 @@ func (fm *FunctionManager) StartAll(functions []FunctionDefinition) error {
 				},
 			}
 
-			// Create and start container
-			resp, err := fm.dockerClient.ContainerCreate(groupCtx, containerCfg, hostCfg, networkingCfg, nil, funcDef.ContainerName)
+			containerID, alreadyRunning, err := ensureContainerRunning(groupCtx, fm.dockerClient, funcDef.ContainerName, containerCfg, hostCfg, networkingCfg)
 			if err != nil {
-				return fmt.Errorf("failed to create container: %w", err)
+				return fmt.Errorf("failed to ensure container %s: %w", funcDef.ContainerName, err)
 			}
 
-			if err := fm.dockerClient.ContainerStart(groupCtx, resp.ID, container.StartOptions{}); err != nil {
-				fm.dockerClient.ContainerRemove(groupCtx, resp.ID, container.RemoveOptions{Force: true})
-				return fmt.Errorf("failed to start container: %w", err)
+			if alreadyRunning {
+				logger.Info("Container already running", "name", funcDef.ContainerName)
+			} else {
+				logger.Info("Container started", "name", funcDef.ContainerName, "id", containerID[:12])
 			}
-
-			logger.Info("Container started", "name", funcDef.ContainerName, "id", resp.ID[:12])
 			return nil
 		})
 	}
@@ -1990,25 +2091,9 @@ func (fm *FunctionManager) StartAll(functions []FunctionDefinition) error {
 // StopAndRemove stops and removes a container by name.
 func (fm *FunctionManager) StopAndRemove(containerName string) error {
 	logger.Info("Stopping container", "name", containerName)
-
-	contJSON, err := fm.dockerClient.ContainerInspect(fm.ctx, containerName)
-	if err != nil {
-		if docker.IsErrNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to inspect container: %w", err)
+	if err := stopAndRemoveContainer(fm.ctx, fm.dockerClient, containerName); err != nil {
+		return err
 	}
-
-	if contJSON.State.Running {
-		if err := fm.dockerClient.ContainerStop(fm.ctx, containerName, container.StopOptions{}); err != nil {
-			logger.Warn("Failed to stop container", "error", err)
-		}
-	}
-
-	if err := fm.dockerClient.ContainerRemove(fm.ctx, containerName, container.RemoveOptions{Force: true}); err != nil {
-		return fmt.Errorf("failed to remove container: %w", err)
-	}
-
 	logger.Info("Container removed", "name", containerName)
 	return nil
 }
@@ -2081,10 +2166,10 @@ func NewCaddyManager(ctx context.Context, dockerClient *docker.Client, container
 		ctx:               ctx,
 		containerName:     containerName,
 		networkName:       networkName,
-		adminAPIAddr:      "localhost:2019",
+		adminAPIAddr:      defaultCaddyAdminAddr,
 		caddyDataVolume:   containerName + "-data",
 		caddyConfigVolume: containerName + "-config",
-		caddyImageName:    "caddy:latest",
+		caddyImageName:    defaultCaddyImage,
 		routerImageName:   containerName + ":latest",
 	}, nil
 }
@@ -2113,7 +2198,7 @@ func (cm *CaddyManager) GenerateCaddyLLB(hostname, adminAddr string) (llb.State,
 
 	// Create Caddyfile
 	caddyfileState := llb.Scratch().File(
-		llb.Mkfile("/Caddyfile", 0644, []byte(caddyfileContent)),
+		llb.Mkfile("/Caddyfile", filePermStandard, []byte(caddyfileContent)),
 		llb.WithCustomName("Create Caddyfile"),
 	)
 
@@ -2244,7 +2329,11 @@ func (cm *CaddyManager) execInCaddyContainer(cmdArgs ...string) (string, string,
 	var stdoutBuf, stderrBuf bytes.Buffer
 	stdcopy.StdCopy(&stdoutBuf, &stderrBuf, hijackedResp.Reader)
 
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-cm.ctx.Done():
+		return stdoutBuf.String(), stderrBuf.String(), cm.ctx.Err()
+	case <-time.After(execSettleDelay):
+	}
 	inspectResp, err := cm.dockerClient.ContainerExecInspect(cm.ctx, execIDResp.ID)
 	if err != nil {
 		return stdoutBuf.String(), stderrBuf.String(), err
@@ -2262,21 +2351,6 @@ func (cm *CaddyManager) execInCaddyContainer(cmdArgs ...string) (string, string,
 func (cm *CaddyManager) Start() error {
 	logger.Info("Starting Caddy router container", "name", cm.containerName)
 
-	// Check if container already exists and is running
-	contJSON, err := cm.dockerClient.ContainerInspect(cm.ctx, cm.containerName)
-	if err == nil {
-		if contJSON.State.Running {
-			logger.Info("Caddy container already running")
-			return nil
-		}
-		// Remove stopped container
-		timeout := 5
-		cm.dockerClient.ContainerStop(cm.ctx, cm.containerName, container.StopOptions{Timeout: &timeout})
-		cm.dockerClient.ContainerRemove(cm.ctx, cm.containerName, container.RemoveOptions{Force: true})
-	} else if !docker.IsErrNotFound(err) {
-		return fmt.Errorf("failed to inspect container: %w", err)
-	}
-
 	// Ensure volumes exist
 	for _, vol := range []string{cm.caddyDataVolume, cm.caddyConfigVolume} {
 		_, err := cm.dockerClient.VolumeCreate(cm.ctx, volume.CreateOptions{Name: vol})
@@ -2286,8 +2360,8 @@ func (cm *CaddyManager) Start() error {
 	}
 
 	// Port mappings
-	httpPort := nat.Port("80/tcp")
-	httpsPort := nat.Port("443/tcp")
+	httpPort := nat.Port(fmt.Sprintf("%d/tcp", defaultHTTPPort))
+	httpsPort := nat.Port(fmt.Sprintf("%d/tcp", defaultHTTPSPort))
 
 	containerCfg := &container.Config{
 		Image:        cm.routerImageName,
@@ -2301,8 +2375,8 @@ func (cm *CaddyManager) Start() error {
 
 	hostCfg := &container.HostConfig{
 		PortBindings: nat.PortMap{
-			httpPort:  []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: "80"}},
-			httpsPort: []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: "443"}},
+			httpPort:  []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", defaultHTTPPort)}},
+			httpsPort: []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", defaultHTTPSPort)}},
 		},
 		Mounts: []mount.Mount{
 			{Type: mount.TypeVolume, Source: cm.caddyDataVolume, Target: "/data"},
@@ -2317,33 +2391,47 @@ func (cm *CaddyManager) Start() error {
 		},
 	}
 
-	resp, err := cm.dockerClient.ContainerCreate(cm.ctx, containerCfg, hostCfg, networkingCfg, nil, cm.containerName)
+	containerID, alreadyRunning, err := ensureContainerRunning(cm.ctx, cm.dockerClient, cm.containerName, containerCfg, hostCfg, networkingCfg)
 	if err != nil {
-		return fmt.Errorf("failed to create Caddy container: %w", err)
+		return fmt.Errorf("failed to ensure Caddy container: %w", err)
 	}
 
-	if err := cm.dockerClient.ContainerStart(cm.ctx, resp.ID, container.StartOptions{}); err != nil {
-		cm.dockerClient.ContainerRemove(cm.ctx, resp.ID, container.RemoveOptions{Force: true})
-		return fmt.Errorf("failed to start Caddy container: %w", err)
+	if alreadyRunning {
+		logger.Info("Caddy container already running")
+		return nil
 	}
 
 	// Wait for Caddy to initialize
-	time.Sleep(3 * time.Second)
-	logger.Info("Caddy router started", "id", resp.ID[:12])
+	if err := waitForContainerReady(cm.ctx, cm.dockerClient, cm.containerName, caddyStartupTimeout); err != nil {
+		return fmt.Errorf("caddy router failed to start: %w", err)
+	}
+	logger.Info("Caddy router started", "id", containerID[:12])
 	return nil
 }
 
 // CaddyRoute represents a route configuration for Caddy's admin API.
 type CaddyRoute struct {
-	ID       string           `json:"@id,omitempty"`
-	Match    []CaddyMatcher   `json:"match,omitempty"`
-	Handle   []map[string]any `json:"handle"`
-	Terminal bool             `json:"terminal,omitempty"`
+	ID       string         `json:"@id,omitempty"`
+	Match    []CaddyMatcher `json:"match,omitempty"`
+	Handle   []CaddyHandler `json:"handle"`
+	Terminal bool           `json:"terminal,omitempty"`
 }
 
 // CaddyMatcher defines route matching criteria.
 type CaddyMatcher struct {
 	Path []string `json:"path"`
+}
+
+// CaddyHandler represents a handler in a Caddy route.
+type CaddyHandler struct {
+	Handler   string          `json:"handler"`
+	URI       string          `json:"uri,omitempty"`
+	Upstreams []CaddyUpstream `json:"upstreams,omitempty"`
+}
+
+// CaddyUpstream represents an upstream server for reverse proxying.
+type CaddyUpstream struct {
+	Dial string `json:"dial"`
 }
 
 // AddFunctionRoute adds a reverse proxy route for a function.
@@ -2356,15 +2444,15 @@ func (cm *CaddyManager) AddFunctionRoute(funcDef FunctionDefinition) error {
 		Match: []CaddyMatcher{
 			{Path: []string{funcDef.InvocationPath}},
 		},
-		Handle: []map[string]any{
+		Handle: []CaddyHandler{
 			{
-				"handler": "rewrite",
-				"uri":     "/",
+				Handler: "rewrite",
+				URI:     "/",
 			},
 			{
-				"handler": "reverse_proxy",
-				"upstreams": []map[string]string{
-					{"dial": fmt.Sprintf("%s:%d", funcDef.ContainerName, funcDef.InternalPort)},
+				Handler: "reverse_proxy",
+				Upstreams: []CaddyUpstream{
+					{Dial: fmt.Sprintf("%s:%d", funcDef.ContainerName, funcDef.InternalPort)},
 				},
 			},
 		},
@@ -2436,24 +2524,9 @@ func (cm *CaddyManager) RemoveFunctionRoute(funcDef FunctionDefinition) error {
 // Shutdown stops and removes the Caddy container.
 func (cm *CaddyManager) Shutdown() error {
 	logger.Info("Shutting down Caddy router")
-
-	contJSON, err := cm.dockerClient.ContainerInspect(cm.ctx, cm.containerName)
-	if err != nil {
-		if docker.IsErrNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to inspect container: %w", err)
+	if err := stopAndRemoveContainer(cm.ctx, cm.dockerClient, cm.containerName); err != nil {
+		return err
 	}
-
-	if contJSON.State.Running {
-		timeout := 10
-		cm.dockerClient.ContainerStop(cm.ctx, contJSON.ID, container.StopOptions{Timeout: &timeout})
-	}
-
-	if err := cm.dockerClient.ContainerRemove(cm.ctx, contJSON.ID, container.RemoveOptions{Force: true}); err != nil {
-		return fmt.Errorf("failed to remove container: %w", err)
-	}
-
 	logger.Info("Caddy router stopped")
 	return nil
 }
@@ -2473,6 +2546,91 @@ func (cm *CaddyManager) RemoveVolumes() error {
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+// waitForContainerReady polls until a container is running or the timeout expires.
+func waitForContainerReady(ctx context.Context, client *docker.Client, containerName string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(containerReadyPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for container %s to be ready", containerName)
+		case <-ticker.C:
+			contJSON, err := client.ContainerInspect(ctx, containerName)
+			if err != nil {
+				continue
+			}
+			if contJSON.State.Running {
+				return nil
+			}
+		}
+	}
+}
+
+// ensureContainerRunning checks if a container exists and is running. If it exists but is stopped,
+// it removes it. If it doesn't exist (or was removed), it creates and starts a new one.
+// Returns the container ID and whether the container was already running (true = already running, no action taken).
+func ensureContainerRunning(ctx context.Context, client *docker.Client, name string, cfg *container.Config, hostCfg *container.HostConfig, netCfg *network.NetworkingConfig) (string, bool, error) {
+	// Check if container exists and is running
+	contJSON, err := client.ContainerInspect(ctx, name)
+	if err == nil {
+		if contJSON.State.Running {
+			return contJSON.ID, true, nil
+		}
+		// Container exists but not running - remove it
+		timeout := defaultStopTimeout
+		client.ContainerStop(ctx, name, container.StopOptions{Timeout: &timeout})
+		if err := client.ContainerRemove(ctx, contJSON.ID, container.RemoveOptions{Force: true}); err != nil {
+			logger.Warn("Failed to remove existing container", "name", name, "error", err)
+		}
+	} else if !docker.IsErrNotFound(err) {
+		return "", false, fmt.Errorf("failed to inspect container: %w", err)
+	}
+
+	// Create container
+	resp, err := client.ContainerCreate(ctx, cfg, hostCfg, netCfg, nil, name)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to create container: %w", err)
+	}
+
+	// Start container
+	if err := client.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		if rmErr := client.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true}); rmErr != nil {
+			return "", false, fmt.Errorf("failed to start container: %w (cleanup also failed: %v)", err, rmErr)
+		}
+		return "", false, fmt.Errorf("failed to start container: %w", err)
+	}
+
+	return resp.ID, false, nil
+}
+
+// stopAndRemoveContainer stops and removes a container by name. Returns nil if not found.
+func stopAndRemoveContainer(ctx context.Context, client *docker.Client, name string) error {
+	contJSON, err := client.ContainerInspect(ctx, name)
+	if err != nil {
+		if docker.IsErrNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to inspect container: %w", err)
+	}
+
+	if contJSON.State.Running {
+		timeout := defaultStopTimeout
+		if err := client.ContainerStop(ctx, contJSON.ID, container.StopOptions{Timeout: &timeout}); err != nil {
+			logger.Warn("Failed to stop container gracefully", "name", name, "error", err)
+		}
+	}
+
+	if err := client.ContainerRemove(ctx, contJSON.ID, container.RemoveOptions{Force: true}); err != nil {
+		return fmt.Errorf("failed to remove container: %w", err)
+	}
+
+	return nil
+}
 
 // removeDockerNetwork removes a Docker network.
 func removeDockerNetwork(ctx context.Context, client *docker.Client, name string) error {
@@ -2986,5 +3144,13 @@ func init() {
 }
 
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	go func() {
+		<-ctx.Done()
+		logger.Info("Received shutdown signal, cleaning up...")
+	}()
+
 	Execute()
 }
