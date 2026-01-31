@@ -88,21 +88,40 @@ import (
 // ============================================================================
 
 const (
-	defaultFunctionPort        = 8000
+	// Port and Address Constants
+	defaultFunctionPort   = 8000
+	defaultHTTPPort       = 80
+	defaultHTTPSPort      = 443
+	defaultCaddyAdminAddr = "localhost:2019"
+
+	// Timeouts and Intervals
 	defaultStopTimeout         = 10
-	defaultCaddyAdminAddr      = "localhost:2019"
-	defaultCaddyImage          = "caddy:latest"
-	defaultBuildkitImage       = "moby/buildkit:latest"
-	defaultHTTPPort            = 80
-	defaultHTTPSPort           = 443
-	filePermStandard           = 0644
-	filePermExecutable         = 0755
 	containerReadyPollInterval = 500 * time.Millisecond
 	execSettleDelay            = 100 * time.Millisecond
 	caddyStartupTimeout        = 30 * time.Second
 	buildkitStartupTimeout     = 30 * time.Second
-	maxFunctionNameLength      = 64
-	maxBuildConcurrency        = 4
+
+	// File Permissions
+	filePermStandard   = 0644
+	filePermExecutable = 0755
+
+	// Limits
+	maxFunctionNameLength = 64
+	maxBuildConcurrency   = 4
+
+	// Default Names and Paths
+	defaultCaddyContainerName    = "smolfaas-router"
+	defaultBuildkitContainerName = "smolfaas-buildkitd"
+	functionContainerNamePrefix  = "smolfaas-func-"
+	functionImageNamePrefix      = "smolfaas-func"
+	functionRouteIDPrefix        = "smolfaas-func-"
+	functionInvocationPathPrefix = "/invoke/"
+	defaultContainerWorkingDir   = "/app"
+	defaultFunctionServerPath    = "/app/server"
+
+	// Docker Image Names
+	defaultCaddyImage    = "caddy:latest"
+	defaultBuildkitImage = "moby/buildkit:latest"
 )
 
 // validFunctionNameRe matches characters that are NOT allowed in function names.
@@ -130,6 +149,10 @@ var (
 	cmdDockerClient *docker.Client
 	logger          *slog.Logger
 )
+
+// consoleMu synchronizes all writes to os.Stderr to prevent output corruption
+// when logger and progress bar write concurrently.
+var consoleMu sync.Mutex
 
 // App holds the shared runtime state for SmolFaaS commands. It is stored in
 // Cobra's command context to enable testability without mutating package globals.
@@ -241,11 +264,11 @@ func (e *BuildError) Unwrap() error {
 
 // BuildResult tracks the outcome of building a single function.
 type BuildResult struct {
-	Function    FunctionDefinition
-	Success     bool
-	Skipped     bool   // True if function was up-to-date
-	BuildErr    *BuildError
-	Duration    time.Duration
+	Function FunctionDefinition
+	Success  bool
+	Skipped  bool // True if function was up-to-date
+	BuildErr *BuildError
+	Duration time.Duration
 }
 
 // ============================================================================
@@ -254,13 +277,13 @@ type BuildResult struct {
 
 // ANSI color codes for terminal output
 const (
-	colorReset   = "\033[0m"
-	colorDim     = "\033[2m"
-	colorBold    = "\033[1m"
-	colorRed     = "\033[31m"
-	colorGreen   = "\033[32m"
-	colorYellow  = "\033[33m"
-	colorCyan    = "\033[36m"
+	colorReset  = "\033[0m"
+	colorDim    = "\033[2m"
+	colorBold   = "\033[1m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorCyan   = "\033[36m"
 )
 
 // PrettyHandler implements slog.Handler with attractive colored output.
@@ -363,7 +386,9 @@ func (h *PrettyHandler) Handle(_ context.Context, r slog.Record) error {
 	})
 
 	buf.WriteString("\n")
+	consoleMu.Lock()
 	_, err := h.out.Write([]byte(buf.String()))
+	consoleMu.Unlock()
 	return err
 }
 
@@ -404,8 +429,8 @@ func (h *PrettyHandler) WithGroup(name string) slog.Handler {
 // BuildProgress tracks the progress of a single function build.
 type BuildProgress struct {
 	FunctionName string
-	Status       string    // "pending", "building", "complete", "failed"
-	CurrentStep  string    // Current build step description
+	Status       string // "pending", "building", "complete", "failed"
+	CurrentStep  string // Current build step description
 	StartTime    time.Time
 	EndTime      time.Time
 	TotalSteps   int
@@ -414,15 +439,15 @@ type BuildProgress struct {
 
 // MultiProgressDisplay manages progress display for multiple concurrent builds.
 type MultiProgressDisplay struct {
-	mu           sync.Mutex
-	builds       map[string]*BuildProgress
-	buildOrder   []string // Maintain consistent ordering
-	out          io.Writer
-	useColor     bool
-	isTTY        bool
-	lastLines    int // Number of lines printed last render (for clearing)
-	startTime    time.Time
-	finalCounts  *BuildFinalCounts // Tracks final vertex counts for transfer phase
+	mu          sync.Mutex
+	builds      map[string]*BuildProgress
+	buildOrder  []string // Maintain consistent ordering
+	out         io.Writer
+	useColor    bool
+	isTTY       bool
+	lastLines   int // Number of lines printed last render (for clearing)
+	startTime   time.Time
+	finalCounts *BuildFinalCounts // Tracks final vertex counts for transfer phase
 }
 
 // NewMultiProgressDisplay creates a new multi-progress display.
@@ -533,7 +558,9 @@ func (mpd *MultiProgressDisplay) render() {
 	lineCount++
 
 	mpd.lastLines = lineCount
+	consoleMu.Lock()
 	mpd.out.Write([]byte(buf.String()))
+	consoleMu.Unlock()
 }
 
 // formatBuildLine formats a single build progress line.
@@ -611,15 +638,17 @@ func (mpd *MultiProgressDisplay) Finish() {
 
 	// Clear the progress display
 	if mpd.lastLines > 0 {
+		consoleMu.Lock()
 		for i := 0; i < mpd.lastLines; i++ {
 			mpd.out.Write([]byte("\033[A\033[K"))
 		}
+		consoleMu.Unlock()
 	}
 }
 
 // BuildFinalCounts stores the final vertex counts after a build's status channel closes.
 type BuildFinalCounts struct {
-	mu    sync.Mutex
+	mu     sync.Mutex
 	counts map[string][2]int // funcName -> [done, total]
 }
 
@@ -849,7 +878,7 @@ func (h *GoRuntimeHandler) GenerateLLB(funcDef FunctionDefinition) (llb.State, e
 	return finalStage, nil
 }
 
-func (h *GoRuntimeHandler) Cmd() []string { return []string{"/app/server"} }
+func (h *GoRuntimeHandler) Cmd() []string { return []string{defaultFunctionServerPath} }
 
 // ============================================================================
 // Python Runtime Handler
@@ -1160,7 +1189,7 @@ func (h *DockerfileRuntimeHandler) UsesDockerfileFrontend() bool {
 
 func (h *DockerfileRuntimeHandler) Cmd() []string {
 	// Default command - can be overridden by Dockerfile CMD
-	return []string{"/app/server"}
+	return []string{defaultFunctionServerPath}
 }
 
 // ============================================================================
@@ -1570,7 +1599,7 @@ func (fb *FaaSBuilder) discoverFunctions(baseDir string) ([]FunctionDefinition, 
 				ImageName:      fmt.Sprintf("%s-%s:latest", fb.imagePrefix, funcName),
 				ContainerName:  fmt.Sprintf("%s-%s", fb.imagePrefix, funcName),
 				InternalPort:   defaultFunctionPort,
-				InvocationPath: fmt.Sprintf("/invoke/%s", funcName),
+				InvocationPath: fmt.Sprintf("%s%s", functionInvocationPathPrefix, funcName),
 				RuntimeVersion: runtimeVersion,
 			})
 		}
@@ -1715,7 +1744,10 @@ func defaultProgressFn() func(ctx context.Context, ch chan *buildkit.SolveStatus
 	return func(buildCtx context.Context, ch chan *buildkit.SolveStatus) error {
 		display, err := progressui.NewDisplay(os.Stderr, progressui.AutoMode)
 		if err != nil {
-			go func() { for range ch {} }()
+			go func() {
+				for range ch {
+				}
+			}()
 			return nil
 		}
 		_, err = display.UpdateFrom(buildCtx, ch)
@@ -1778,7 +1810,10 @@ func (fb *FaaSBuilder) buildAndLoadFunctionImage(def *llb.Definition, funcDef *F
 		}
 		display, err := progressui.NewDisplay(os.Stderr, progressui.AutoMode)
 		if err != nil {
-			go func() { for range ch {} }()
+			go func() {
+				for range ch {
+				}
+			}()
 			return nil
 		}
 		_, err = display.UpdateFrom(buildCtx, ch)
@@ -1999,6 +2034,9 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 		return
 	}
 
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+
 	// Check if we should use colors
 	useColor := term.IsTerminal(int(os.Stderr.Fd()))
 
@@ -2017,9 +2055,16 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 	}
 
 	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "┌─────────────────────────────────────────────────────────────┐")
-	fmt.Fprintln(os.Stderr, "│                      Build Summary                          │")
-	fmt.Fprintln(os.Stderr, "├─────────────────────────────────────────────────────────────┤")
+
+	boxWidth := 43
+	topBorder := "┌" + strings.Repeat("─", boxWidth) + "┐"
+	fmt.Fprintln(os.Stderr, topBorder)
+
+	headerPadding := (boxWidth - len("Build Summary")) / 2
+	fmt.Fprintf(os.Stderr, "│%*s%s%*s│\n", headerPadding+1, "", "Build Summary", boxWidth-headerPadding, "")
+
+	divider := "├" + strings.Repeat("─", boxWidth) + "┤"
+	fmt.Fprintln(os.Stderr, divider)
 
 	for _, r := range results {
 		var status, icon, color string
@@ -2048,20 +2093,26 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 		}
 
 		name := r.Function.Name
-		if len(name) > 24 {
-			name = name[:21] + "..."
+		if len(name) > 20 {
+			name = name[:17] + "..."
+		}
+
+		contentWidth := 2 + 1 + 1 + 20 + 1 + 12 + 1
+		maxDetailWidth := boxWidth - contentWidth
+		if maxDetailWidth < 0 {
+			maxDetailWidth = 0
 		}
 
 		if useColor {
-			fmt.Fprintf(os.Stderr, "│  %s%s%s %-24s %-12s %s\n",
+			fmt.Fprintf(os.Stderr, "│ %s%s%s %-20s %-12s %-12s│\n",
 				color, icon, colorReset, name, status, detail)
 		} else {
-			fmt.Fprintf(os.Stderr, "│  %s %-24s %-12s %s\n",
+			fmt.Fprintf(os.Stderr, "│ %s %-20s %-12s %-12s│\n",
 				icon, name, status, detail)
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "├─────────────────────────────────────────────────────────────┤")
+	fmt.Fprintln(os.Stderr, divider)
 
 	// Summary line
 	summaryParts := []string{}
@@ -2088,8 +2139,12 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 	}
 
 	summary := strings.Join(summaryParts, ", ")
-	fmt.Fprintf(os.Stderr, "│  Total: %-52s │\n", summary)
-	fmt.Fprintln(os.Stderr, "└─────────────────────────────────────────────────────────────┘")
+	contentLen := len("Total: ") + len(summary)
+	padding := boxWidth - contentLen
+	fmt.Fprintf(os.Stderr, "│  Total: %s%*s │\n", summary, padding, "")
+
+	bottomBorder := "└" + strings.Repeat("─", boxWidth) + "┘"
+	fmt.Fprintln(os.Stderr, bottomBorder)
 	fmt.Fprintln(os.Stderr)
 
 	// Print detailed error messages for failed builds
@@ -2152,7 +2207,7 @@ func (fm *FunctionManager) StartAll(functions []FunctionDefinition) error {
 
 			containerCfg := &container.Config{
 				Image:        funcDef.ImageName,
-				WorkingDir:   "/app",
+				WorkingDir:   defaultContainerWorkingDir,
 				Cmd:          funcDef.RuntimeHandler.Cmd(),
 				Env:          []string{fmt.Sprintf("PORT=%d", funcDef.InternalPort)},
 				ExposedPorts: nat.PortSet{exposedPort: struct{}{}},
@@ -2518,7 +2573,7 @@ type CaddyUpstream struct {
 
 // AddFunctionRoute adds a reverse proxy route for a function.
 func (cm *CaddyManager) AddFunctionRoute(funcDef FunctionDefinition) error {
-	routeID := "smolfaas-func-" + funcDef.Name
+	routeID := functionRouteIDPrefix + funcDef.Name
 	logger.Info("Adding Caddy route", "function", funcDef.Name, "path", funcDef.InvocationPath)
 
 	route := CaddyRoute{
@@ -2578,7 +2633,7 @@ func (cm *CaddyManager) AddFunctionRoute(funcDef FunctionDefinition) error {
 
 // RemoveFunctionRoute removes a function's route from Caddy.
 func (cm *CaddyManager) RemoveFunctionRoute(funcDef FunctionDefinition) error {
-	routeID := "smolfaas-func-" + funcDef.Name
+	routeID := functionRouteIDPrefix + funcDef.Name
 	logger.Info("Removing Caddy route", "function", funcDef.Name)
 
 	apiPath := fmt.Sprintf("/id/%s", routeID)
@@ -2873,7 +2928,7 @@ func (cc *ConsistencyChecker) RunCheck() ([]CheckResult, error) {
 		}
 
 		// Check container
-		containerName := fmt.Sprintf("%s-%s", cc.imagePrefix, funcName)
+		containerName := fmt.Sprintf("%s%s", functionContainerNamePrefix, funcName)
 		contJSON, err := cc.dockerClient.ContainerInspect(cc.ctx, containerName)
 		if err != nil {
 			if docker.IsErrNotFound(err) {
@@ -2894,7 +2949,7 @@ func (cc *ConsistencyChecker) RunCheck() ([]CheckResult, error) {
 		}
 
 		// Check image
-		imageName := fmt.Sprintf("%s-%s:latest", cc.imagePrefix, funcName)
+		imageName := fmt.Sprintf("%s-%s:latest", functionImageNamePrefix, funcName)
 		imgInspect, err := cc.dockerClient.ImageInspect(cc.ctx, imageName)
 		if err != nil {
 			if docker.IsErrNotFound(err) {
@@ -2918,7 +2973,7 @@ func (cc *ConsistencyChecker) RunCheck() ([]CheckResult, error) {
 		}
 
 		// Check route
-		expectedRouteID := "smolfaas-func-" + funcName
+		expectedRouteID := functionRouteIDPrefix + funcName
 		if routeIDs == nil {
 			result.RouteOK = false
 			result.RouteMessage = "Caddy not reachable"
@@ -3017,7 +3072,8 @@ var upCmd = &cobra.Command{
 		defer hashMgr.Close()
 
 		// Initialize BuildKit
-		buildkitMgr, err := NewBuildkitManager(cmdCtx, cmdDockerClient, buildkitContainerName, buildkitCacheVolumeName)
+		app := getApp(cmd)
+		buildkitMgr, err := NewBuildkitManager(app.Ctx, app.DockerClient, buildkitContainerName, buildkitCacheVolumeName)
 		if err != nil {
 			return fmt.Errorf("failed to init BuildkitManager: %w", err)
 		}
@@ -3030,7 +3086,7 @@ var upCmd = &cobra.Command{
 		}
 
 		// Build Caddy router image first
-		caddyMgr, err := NewCaddyManager(cmdCtx, cmdDockerClient, caddyContainerName, networkName)
+		caddyMgr, err := NewCaddyManager(app.Ctx, app.DockerClient, caddyContainerName, networkName)
 		if err != nil {
 			return fmt.Errorf("failed to init CaddyManager: %w", err)
 		}
@@ -3062,7 +3118,7 @@ var upCmd = &cobra.Command{
 		}
 
 		// Start function containers
-		funcMgr, err := NewFunctionManager(cmdCtx, cmdDockerClient, networkName)
+		funcMgr, err := NewFunctionManager(app.Ctx, app.DockerClient, networkName)
 		if err != nil {
 			return fmt.Errorf("failed to init FunctionManager: %w", err)
 		}
@@ -3109,12 +3165,13 @@ Use --force for full cleanup including volumes, network, and dangling images.`,
 			}
 		}()
 
-		funcMgr, funcErr := NewFunctionManager(cmdCtx, cmdDockerClient, networkName)
+		app := getApp(cmd)
+		funcMgr, funcErr := NewFunctionManager(app.Ctx, app.DockerClient, networkName)
 		if funcErr != nil {
 			logger.Warn("Failed to init FunctionManager", "error", funcErr)
 		}
 
-		caddyMgr, caddyErr := NewCaddyManager(cmdCtx, cmdDockerClient, caddyContainerName, networkName)
+		caddyMgr, caddyErr := NewCaddyManager(app.Ctx, app.DockerClient, caddyContainerName, networkName)
 		if caddyErr != nil {
 			logger.Warn("Failed to init CaddyManager", "error", caddyErr)
 		}
@@ -3135,9 +3192,9 @@ Use --force for full cleanup including volumes, network, and dangling images.`,
 				if caddyMgr != nil {
 					caddyMgr.RemoveVolumes()
 				}
-				removeDockerVolume(cmdCtx, cmdDockerClient, buildkitCacheVolumeName)
-				removeDockerNetwork(cmdCtx, cmdDockerClient, networkName)
-				pruneDanglingImages(cmdCtx, cmdDockerClient)
+				removeDockerVolume(app.Ctx, app.DockerClient, buildkitCacheVolumeName)
+				removeDockerNetwork(app.Ctx, app.DockerClient, networkName)
+				pruneDanglingImages(app.Ctx, app.DockerClient)
 
 				// Remove state database
 				if stateDBPath != "" {
@@ -3190,10 +3247,11 @@ var checkCmd = &cobra.Command{
 		}
 		defer hashMgr.Close()
 
+		app := getApp(cmd)
 		checker := &ConsistencyChecker{
-			dockerClient:       cmdDockerClient,
+			dockerClient:       app.DockerClient,
 			hashMgr:            hashMgr,
-			ctx:                cmdCtx,
+			ctx:                app.Ctx,
 			imagePrefix:        faasImagePrefix,
 			functionsDir:       functionsDir,
 			caddyContainerName: caddyContainerName,
@@ -3273,8 +3331,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&functionsDir, "functions-dir", "d", "./functions", "Directory containing function sources")
 	rootCmd.PersistentFlags().StringVarP(&functionsAddr, "addr", "a", "fn.localhost", "Router hostname")
 	rootCmd.PersistentFlags().StringVarP(&networkName, "network", "n", "smolfaas", "Docker network name")
-	rootCmd.PersistentFlags().StringVar(&caddyContainerName, "caddy-name", "smolfaas-router", "Caddy container name")
-	rootCmd.PersistentFlags().StringVar(&buildkitContainerName, "buildkit-name", "smolfaas-buildkitd", "BuildKit container name")
+	rootCmd.PersistentFlags().StringVar(&caddyContainerName, "caddy-name", defaultCaddyContainerName, "Caddy container name")
+	rootCmd.PersistentFlags().StringVar(&buildkitContainerName, "buildkit-name", defaultBuildkitContainerName, "BuildKit container name")
 	rootCmd.PersistentFlags().StringVarP(&faasImagePrefix, "image-prefix", "p", "smolfaas-func", "Image/container name prefix")
 	rootCmd.PersistentFlags().StringVar(&stateDBPath, "state-db", ".smolfaas/state.db", "Path to SQLite state database")
 
