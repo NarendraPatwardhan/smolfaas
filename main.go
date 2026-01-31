@@ -3356,7 +3356,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&caddyContainerName, "caddy-name", defaultCaddyContainerName, "Caddy container name")
 	rootCmd.PersistentFlags().StringVar(&buildkitContainerName, "buildkit-name", defaultBuildkitContainerName, "BuildKit container name")
 	rootCmd.PersistentFlags().StringVarP(&faasImagePrefix, "image-prefix", "p", "smolfaas-func", "Image/container name prefix")
-	rootCmd.PersistentFlags().StringVar(&stateDBPath, "state-db", ".smolfaas/state.db", "Path to SQLite state database")
+	rootCmd.PersistentFlags().StringVar(&stateDBPath, "state-db", ".smolfaas", "Path to SQLite state database")
 
 	// Add subcommands
 	rootCmd.AddCommand(upCmd)

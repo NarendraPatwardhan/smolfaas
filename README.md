@@ -255,7 +255,7 @@ When a `Dockerfile` is present in the function directory, SmolFaaS uses it inste
 | `--caddy-name` | `smolfaas-router` | Caddy container name |
 | `--buildkit-name` | `smolfaas-buildkitd` | BuildKit container name |
 | `--image-prefix, -p` | `smolfaas-func` | Image/container name prefix |
-| `--state-db` | `.smolfaas/state.db` | SQLite state database path |
+| `--state-db` | `.smolfaas` | SQLite state database path |
 
 ## State Management
 
