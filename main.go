@@ -2056,12 +2056,19 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 
 	fmt.Fprintln(os.Stderr)
 
-	boxWidth := 43
+	// Layout configuration
+	// Fixed Interior Width: 48 chars
+	// " I Name................ Status.... Duration.... "
+	// 1+1+1 + 20 + 1 + 10 + 1 + 12 + 1 = 48
+	boxWidth := 48
+
 	topBorder := "┌" + strings.Repeat("─", boxWidth) + "┐"
 	fmt.Fprintln(os.Stderr, topBorder)
 
-	headerPadding := (boxWidth - len("Build Summary")) / 2
-	fmt.Fprintf(os.Stderr, "│%*s%s%*s│\n", headerPadding+1, "", "Build Summary", boxWidth-headerPadding, "")
+	title := "Build Summary"
+	leftPad := (boxWidth - len(title)) / 2
+	rightPad := boxWidth - len(title) - leftPad
+	fmt.Fprintf(os.Stderr, "│%*s%s%*s│\n", leftPad, "", title, rightPad, "")
 
 	divider := "├" + strings.Repeat("─", boxWidth) + "┤"
 	fmt.Fprintln(os.Stderr, divider)
@@ -2094,20 +2101,21 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 
 		name := r.Function.Name
 		if len(name) > 20 {
-			name = name[:17] + "..."
+			name = name[:19] + "…"
 		}
 
-		contentWidth := 2 + 1 + 1 + 20 + 1 + 12 + 1
-		maxDetailWidth := boxWidth - contentWidth
-		if maxDetailWidth < 0 {
-			maxDetailWidth = 0
+		if len(detail) > 12 {
+			detail = detail[:11] + "…"
 		}
 
+		// Format: "│ I Name... Status... Detail... │"
+		// Spaces: Start(1), AfterIcon(1), AfterName(1), AfterStatus(1), End(1)
+		// Widths: Icon(1), Name(20), Status(10), Detail(12)
 		if useColor {
-			fmt.Fprintf(os.Stderr, "│ %s%s%s %-20s %-12s %-12s│\n",
+			fmt.Fprintf(os.Stderr, "│ %s%s%s %-20s %-10s %-12s │\n",
 				color, icon, colorReset, name, status, detail)
 		} else {
-			fmt.Fprintf(os.Stderr, "│ %s %-20s %-12s %-12s│\n",
+			fmt.Fprintf(os.Stderr, "│ %s %-20s %-10s %-12s │\n",
 				icon, name, status, detail)
 		}
 	}
@@ -2115,32 +2123,46 @@ func (fb *FaaSBuilder) printBuildSummary(results []BuildResult) {
 	fmt.Fprintln(os.Stderr, divider)
 
 	// Summary line
-	summaryParts := []string{}
+	var summaryParts []string
+	var plainSummaryParts []string
+
 	if built > 0 {
+		part := fmt.Sprintf("%d built", built)
+		plainSummaryParts = append(plainSummaryParts, part)
 		if useColor {
-			summaryParts = append(summaryParts, fmt.Sprintf("%s%d built%s", colorGreen, built, colorReset))
+			summaryParts = append(summaryParts, fmt.Sprintf("%s%s%s", colorGreen, part, colorReset))
 		} else {
-			summaryParts = append(summaryParts, fmt.Sprintf("%d built", built))
+			summaryParts = append(summaryParts, part)
 		}
 	}
 	if skipped > 0 {
+		part := fmt.Sprintf("%d up-to-date", skipped)
+		plainSummaryParts = append(plainSummaryParts, part)
 		if useColor {
-			summaryParts = append(summaryParts, fmt.Sprintf("%s%d up-to-date%s", colorDim, skipped, colorReset))
+			summaryParts = append(summaryParts, fmt.Sprintf("%s%s%s", colorDim, part, colorReset))
 		} else {
-			summaryParts = append(summaryParts, fmt.Sprintf("%d up-to-date", skipped))
+			summaryParts = append(summaryParts, part)
 		}
 	}
 	if failed > 0 {
+		part := fmt.Sprintf("%d failed", failed)
+		plainSummaryParts = append(plainSummaryParts, part)
 		if useColor {
-			summaryParts = append(summaryParts, fmt.Sprintf("%s%d failed%s", colorRed, failed, colorReset))
+			summaryParts = append(summaryParts, fmt.Sprintf("%s%s%s", colorRed, part, colorReset))
 		} else {
-			summaryParts = append(summaryParts, fmt.Sprintf("%d failed", failed))
+			summaryParts = append(summaryParts, part)
 		}
 	}
 
 	summary := strings.Join(summaryParts, ", ")
-	contentLen := len("Total: ") + len(summary)
-	padding := boxWidth - contentLen
+	plainSummary := strings.Join(plainSummaryParts, ", ")
+
+	// "  Total: " is 9 chars.
+	// We need 1 trailing space before the right border.
+	padding := boxWidth - (9 + len(plainSummary) + 1)
+	if padding < 0 {
+		padding = 0
+	}
 	fmt.Fprintf(os.Stderr, "│  Total: %s%*s │\n", summary, padding, "")
 
 	bottomBorder := "└" + strings.Repeat("─", boxWidth) + "┘"
